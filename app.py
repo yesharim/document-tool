@@ -44,7 +44,8 @@ IMAGE_MIME = {
 
 FIELDS = {"doc_type": "אחר", "source": None, "date_start": None, "date_end": None,
           "period_label": None, "account_last3": None, "property_address": None,
-          "person_name": None, "business_name": None, "summary": "", "confidence": 0.0}
+          "person_name": None, "business_name": None, "page_num": None, "page_total": None,
+          "summary": "", "confidence": 0.0}
 
 # כללי מתן-שמות ברירת מחדל (ניתן לערוך במסך). מבוסס על טבלת "איך לקרוא לדוח".
 DEFAULT_NAMING_RULES = """בנה שם קובץ (בלי סיומת) לפי סוג המסמך, בסדר: מילת-סוג + מזהים.
@@ -122,6 +123,19 @@ DEFAULT_NAMING_RULES = """בנה שם קובץ (בלי סיומת) לפי סוג
 # --------------------------------------------------------------- פונקציות עזר
 
 
+def _extract_json(text: str):
+    """מחלץ את אובייקט ה-JSON מהתשובה, גם אם יש טקסט מסביב."""
+    t = _clean_json(text)
+    try:
+        return json.loads(t)
+    except Exception:
+        pass
+    i, j = t.find("{"), t.rfind("}")
+    if i != -1 and j > i:
+        return json.loads(t[i:j + 1])
+    raise ValueError("no json")
+
+
 def _clean_json(text: str) -> str:
     text = text.strip()
     if text.startswith("```"):
@@ -180,6 +194,8 @@ def analyze_one(client: Anthropic, model: str, name: str, data: bytes) -> dict:
         '"property_address": "כתובת נכס אם רלוונטי או null", '
         '"person_name": "השם הפרטי של האדם/הלקוח שהמסמך שייך לו, או null", '
         '"business_name": "שם עסק/חברה אם רלוונטי או null", '
+        '"page_num": מספר הדף הנוכחי אם מופיע מספור (למשל "דף 2 מתוך 5" / "עמוד 2 מתוך 4" / "1/2") אחרת null, '
+        '"page_total": סך הדפים באותו מספור, אחרת null, '
         '"summary": "משפט קצר בעברית", '
         '"confidence": מספר בין 0 ל-1}\n'
         "date_start/date_end = טווח התאריכים שבמסמך. אם יום בודד – שים אותו בשניהם."
@@ -199,38 +215,56 @@ def analyze_one(client: Anthropic, model: str, name: str, data: bytes) -> dict:
     return result
 
 
-def group_files(client: Anthropic, model: str, per_file: list, naming_rules: str) -> list:
-    """מעבר 2 – קיבוץ ומתן-שמות (טקסט בלבד). השם מזוהה מתוך המסמכים."""
+def group_files(client: Anthropic, model: str, per_file: list, naming_rules: str):
+    """מעבר 2 – קיבוץ ומתן-שמות (טקסט בלבד). מחזיר (קבוצות, שגיאה_אם_יש)."""
     payload = [
         {"index": i, "filename": f["filename"], **{k: f["a"].get(k) for k in FIELDS}}
         for i, f in enumerate(per_file)
     ]
     prompt = (
-        "קיבלת רשימת קבצים. קבץ יחד קבצים שהם אותו מסמך לוגי "
-        "(אותו סוג + אותו מקור + אותו אדם + תאריכים רציפים/חופפים). לדוגמה 10 תמונות של אותם "
-        "דפי עו״ש = קבוצה אחת; דוח יתרות נפרד = קבוצה אחרת.\n"
-        "חוק ברזל: לעולם אל תשים באותה קבוצה מסמכים של שני אנשים שונים (person_name שונה). "
-        "בכל קבוצה השתמש בשם האדם של אותה קבוצה בלבד – אל תיקח שם מקבוצה אחרת.\n"
-        "אם המסמך ברור וזוהה היטב – תן confidence גבוה (0.8-1). "
-        "הורד confidence רק אם באמת לא ברור מה המסמך או של מי הוא.\n\n"
+        "קיבלת רשימת דפים/קבצים שלקוח שלח. קבץ יחד קבצים שהם אותו מסמך לוגי.\n\n"
+        "סימני היכר לאותו מסמך:\n"
+        "1. מספור דפים – זה הסימן החזק ביותר. אם page_total זהה (למשל כמה דפים עם 'מתוך 5'), "
+        "ואותו סוג ומקור – זה מסמך אחד, וכל הדפים 1..page_total שייכים לו.\n"
+        "2. אותו סוג מסמך + אותו מקור (בנק) + אותו מספר חשבון.\n"
+        "3. תאריכים רציפים או חופפים.\n\n"
+        "שים לב: שני מסמכים מאותו בנק אך בטווחי תאריכים שונים = שני מסמכים נפרדים.\n"
+        "חוק ברזל: לעולם אל תשים באותה קבוצה מסמכים של שני אנשים שונים.\n"
+        "שם האדם מופיע לרוב רק בדף הראשון; אם דף אחד בקבוצה מכיל person_name – הוא תקף לכל הקבוצה.\n"
+        "בשם הקובץ: קח את התאריך המוקדם ביותר ואת המאוחר ביותר מכל דפי הקבוצה.\n"
+        "אם המסמך ברור – תן confidence גבוה (0.8-1). הורד רק אם באמת לא ברור.\n\n"
         f"{naming_rules}\n\n"
-        "החזר JSON בלבד במבנה:\n"
+        "החזר JSON בלבד, בלי טקסט מסביב:\n"
         '{"groups": [{"indices": [0,1], "doc_type": "...", "final_name": "שם לפי הכללים", '
-        '"confidence": מספר בין 0 ל-1, "note": "הערה קצרה אם יש ספק"}]}\n'
-        "כל קובץ חייב להופיע בקבוצה אחת בדיוק. סדר את ה-indices בכל קבוצה לפי התאריך.\n\n"
-        "הקבצים:\n" + json.dumps(payload, ensure_ascii=False, indent=2)
+        '"confidence": 0.9, "note": ""}]}\n'
+        "כל קובץ חייב להופיע בקבוצה אחת בדיוק. סדר את ה-indices לפי page_num (ואם אין – לפי תאריך).\n\n"
+        "הקבצים:\n" + json.dumps(payload, ensure_ascii=False, indent=1)
     )
-    resp = client.messages.create(
-        model=model, max_tokens=1500,
-        messages=[{"role": "user", "content": [{"type": "text", "text": prompt}]}],
-    )
-    raw = "".join(b.text for b in resp.content if b.type == "text")
     try:
-        return json.loads(_clean_json(raw)).get("groups", [])
-    except Exception:
-        return [{"indices": [i], "doc_type": f["a"].get("doc_type", "אחר"),
-                 "final_name": f["filename"].rsplit(".", 1)[0],
-                 "confidence": 0.0, "note": "לא ניתן לקבץ אוטומטית"} for i, f in enumerate(per_file)]
+        resp = client.messages.create(
+            model=model, max_tokens=8000,
+            messages=[{"role": "user", "content": [{"type": "text", "text": prompt}]}],
+        )
+        raw = "".join(b.text for b in resp.content if b.type == "text")
+        stop = getattr(resp, "stop_reason", None)
+        groups = _extract_json(raw).get("groups", [])
+        if not groups:
+            raise ValueError("empty groups")
+        # ודא שכל קובץ שויך; מה שנשמט – לקבוצה משלו
+        seen = {i for g in groups for i in g.get("indices", [])}
+        for i in range(len(per_file)):
+            if i not in seen:
+                groups.append({"indices": [i], "doc_type": per_file[i]["a"].get("doc_type"),
+                               "final_name": per_file[i]["filename"].rsplit(".", 1)[0],
+                               "confidence": 0.0, "note": "לא שויך לקבוצה"})
+        err = "התשובה נחתכה באמצע – ייתכן שהקיבוץ חלקי." if stop == "max_tokens" else None
+        return groups, err
+    except Exception as e:
+        fallback = [{"indices": [i], "doc_type": f["a"].get("doc_type", "אחר"),
+                     "final_name": f["filename"].rsplit(".", 1)[0],
+                     "confidence": 0.0, "note": "לא ניתן לקבץ אוטומטית"}
+                    for i, f in enumerate(per_file)]
+        return fallback, f"שלב הקיבוץ נכשל: {type(e).__name__}: {e}"
 
 
 def merge_to_pdf(files_bytes: list, names: list) -> bytes:
@@ -303,9 +337,14 @@ def analyze_cached(client, model, name, data, only_edges):
 
 
 def sort_key(m):
-    """מיון בתוך קבוצה: לפי תאריך, ואם אין – לפי שם הקובץ."""
+    """מיון בתוך קבוצה: קודם לפי מספר הדף, אחרת לפי תאריך, אחרת לפי שם."""
+    p = m["a"].get("page_num")
+    try:
+        p = int(p)
+    except (TypeError, ValueError):
+        p = None
     d = m["a"].get("date_start") or m["a"].get("date_end") or ""
-    return (d == "", d, m["filename"])
+    return (p is None, p or 0, d == "", d, m["filename"])
 
 
 c1, c2 = st.columns([1, 1])
@@ -339,7 +378,9 @@ if run:
         prog.progress((i + 1) / len(files), text=f"נקרא: {f['filename']}")
     prog.progress(1.0, text="מקבץ ונותן שמות...")
 
-    groups = group_files(client, PRECISE_MODEL, per_file, naming_rules)
+    groups, group_err = group_files(client, PRECISE_MODEL, per_file, naming_rules)
+    if group_err:
+        st.error(f"⚠️ {group_err}")
     prog.empty()
 
     # בניית קבצים ממוזגים
@@ -371,6 +412,8 @@ if run:
         "zip": zip_buf.getvalue(), "ok": ok_groups, "review": review_groups,
         "table": [{"קובץ": m["filename"], "זוהה כ": m["a"].get("doc_type"),
                    "שם שזוהה": m["a"].get("person_name"),
+                   "דף": (f'{m["a"].get("page_num")}/{m["a"].get("page_total")}'
+                          if m["a"].get("page_num") else ""),
                    "ביטחון": round(float(m["a"].get("confidence") or 0), 2),
                    "נקרא ב": m["used"]} for m in per_file],
         "n_files": len(files), "from_cache": from_cache,
