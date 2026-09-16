@@ -41,7 +41,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-TOOL_BUILD = "sorter-2026-09-16-v20"         # גרסת כלי המיון (נפרד מ-BUILD של המנוע)
+TOOL_BUILD = "sorter-2026-09-16-v21"         # גרסת כלי המיון (נפרד מ-BUILD של המנוע)
 
 CHEAP_MODEL = "claude-haiku-4-5-20251001"   # דגם זול לקריאה
 PRECISE_MODEL = "claude-sonnet-5"           # דגם מדויק לשדרוג ולקיבוץ
@@ -614,6 +614,20 @@ _CALL_VARIANTS = [
 ]
 
 
+def _is_param_error(e: Exception) -> bool:
+    """האם השגיאה נובעת מפרמטר שלא התקבל, ולא מתקלה אמיתית.
+
+    שני מצבים: הספרייה לא מכירה את הפרמטר (TypeError), או שהספרייה מעבירה
+    אותו והשרת דוחה את הבקשה (מצב 400). כל שאר השגיאות - מפתח שגוי, מכסה
+    שנגמרה, תקלת רשת - חייבות לעלות למעלה ולא להיבלע כאן.
+    """
+    if isinstance(e, TypeError):
+        return True
+    if getattr(e, "status_code", None) == 400:
+        return True
+    return "BadRequest" in type(e).__name__
+
+
 def _create(client: Anthropic, model: str, max_tokens: int, content: list):
     """קריאה למודל, עמידה להבדלי גרסאות של הספרייה.
 
@@ -635,11 +649,11 @@ def _create(client: Anthropic, model: str, max_tokens: int, content: list):
             st.session_state["call_variant_desc"] = (
                 ", ".join(extra.keys()) if extra else "ברירת מחדל")
             return resp
-        except TypeError as e:
-            last_err = e          # הספרייה לא מכירה את הפרמטר – ננסה צורה פשוטה יותר
-            continue
-        except Exception:
-            raise                 # שגיאה אמיתית (רשת, מפתח, מכסה) – לא לבלוע
+        except Exception as e:
+            if not _is_param_error(e):
+                raise             # שגיאה אמיתית (רשת, מפתח, מכסה) – לא לבלוע
+            last_err = e
+            continue              # הפרמטר נדחה – ננסה צורה פשוטה יותר
     raise last_err
 
 
