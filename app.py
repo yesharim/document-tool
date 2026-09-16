@@ -41,7 +41,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-TOOL_BUILD = "sorter-2026-09-16-v19"         # גרסת כלי המיון (נפרד מ-BUILD של המנוע)
+TOOL_BUILD = "sorter-2026-09-16-v20"         # גרסת כלי המיון (נפרד מ-BUILD של המנוע)
 
 CHEAP_MODEL = "claude-haiku-4-5-20251001"   # דגם זול לקריאה
 PRECISE_MODEL = "claude-sonnet-5"           # דגם מדויק לשדרוג ולקיבוץ
@@ -600,33 +600,47 @@ def _targeting_prompt(case_docs: list) -> str:
     )
 
 
+# צורות הקריאה לפי סדר עדיפות. גרסאות שונות של ספריית Anthropic מקבלות
+# פרמטרים שונים, וסטרימליט מושכת את הגרסה שיש ברגע הפריסה. במקום להניח,
+# מנסים מהטובה ביותר לפשוטה ביותר ועוצרים בראשונה שעובדת.
+#   temperature=0  -> תשובה קבועה לאותו קלט. קריטי למשימת חילוץ.
+#   thinking off   -> חוסך טוקני חשיבה, ומונע מצב שהחשיבה בולעת את כל התשובה.
+_CALL_VARIANTS = [
+    {"temperature": 0, "thinking": {"type": "disabled"}},
+    {"temperature": 0},
+    {"extra_body": {"temperature": 0}},
+    {"thinking": {"type": "disabled"}},
+    {},
+]
+
+
 def _create(client: Anthropic, model: str, max_tokens: int, content: list):
-    """קריאה למודל עם ניסיון לכבות חשיבה פנימית.
+    """קריאה למודל, עמידה להבדלי גרסאות של הספרייה.
 
-    למה: המשימה כאן היא חילוץ שדות ממסמך, לא בעיה שדורשת מחשבה. כשהחשיבה
-    פעילה היא נספרת כטוקני פלט - כלומר עולה כסף - ובמקרה אחד היא בלעה את כל
-    תקרת האורך והתשובה חזרה ריקה לגמרי.
-
-    אם הפרמטר אינו נתמך, נופלים חזרה לקריאה רגילה. התוצאה נשמרת כדי שלא
-    ננסה שוב בכל קריאה.
+    הצורה שנמצאה עובדת נשמרת, כך שהניסוי קורה פעם אחת בלבד בכל הפעלה.
     """
     msgs = [{"role": "user", "content": content}]
-    # temperature=0: המשימה היא חילוץ שדות ממסמך, ויש לה תשובה אחת נכונה.
-    # בלי זה המודל נותן תשובה שונה בכל הרצה על אותו קלט בדיוק - אותו קובץ
-    # יוצא פעם תלוש שכר ופעם דוח תנועות. זו הייתה הסיבה העיקרית לחוסר
-    # היציבות בין הרצות, ולא הפורמט.
-    if st.session_state.get("no_thinking_param") is not True:
+    idx = st.session_state.get("call_variant")
+
+    if idx is not None:
+        return client.messages.create(model=model, max_tokens=max_tokens,
+                                      messages=msgs, **_CALL_VARIANTS[idx])
+
+    last_err = None
+    for i, extra in enumerate(_CALL_VARIANTS):
         try:
-            resp = client.messages.create(
-                model=model, max_tokens=max_tokens, messages=msgs,
-                temperature=0, thinking={"type": "disabled"},
-            )
-            st.session_state["no_thinking_param"] = False
+            resp = client.messages.create(model=model, max_tokens=max_tokens,
+                                          messages=msgs, **extra)
+            st.session_state["call_variant"] = i
+            st.session_state["call_variant_desc"] = (
+                ", ".join(extra.keys()) if extra else "ברירת מחדל")
             return resp
+        except TypeError as e:
+            last_err = e          # הספרייה לא מכירה את הפרמטר – ננסה צורה פשוטה יותר
+            continue
         except Exception:
-            st.session_state["no_thinking_param"] = True
-    return client.messages.create(model=model, max_tokens=max_tokens,
-                                  messages=msgs, temperature=0)
+            raise                 # שגיאה אמיתית (רשת, מפתח, מכסה) – לא לבלוע
+    raise last_err
 
 
 def _text_of(resp) -> str:
@@ -950,6 +964,13 @@ with st.sidebar:
     cost_slot = st.empty()
 
     st.caption(f"גרסת כלי: {TOOL_BUILD}")
+    _cv = st.session_state.get("call_variant_desc")
+    if _cv:
+        st.caption(f"מצב קריאה מול השרת: {_cv}")
+        if "temperature" not in _cv:
+            st.warning("שימי לב: הספרייה שמותקנת לא מקבלת temperature, ולכן "
+                       "התשובות עלולות להשתנות בין הרצות על אותם קבצים. "
+                       "כדאי לנעול גרסה של anthropic בקובץ requirements.")
 
 uploaded = st.file_uploader(
     "גררי לכאן את כל הקבצים של הלקוח",
