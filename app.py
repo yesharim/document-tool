@@ -41,7 +41,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-TOOL_BUILD = "sorter-2026-09-16-v15"         # גרסת כלי המיון (נפרד מ-BUILD של המנוע)
+TOOL_BUILD = "sorter-2026-09-16-v17"         # גרסת כלי המיון (נפרד מ-BUILD של המנוע)
 
 CHEAP_MODEL = "claude-haiku-4-5-20251001"   # דגם זול לקריאה
 PRECISE_MODEL = "claude-sonnet-5"           # דגם מדויק לשדרוג ולקיבוץ
@@ -513,11 +513,8 @@ def analyze_one(client: Anthropic, model: str, name: str, data: bytes,
         "שקיבלת, לא לאחרון."
         + _people_context(case_docs)
     )
-    resp = client.messages.create(
-        model=model, max_tokens=700,
-        messages=[{"role": "user",
-                   "content": blocks + [{"type": "text", "text": prompt}]}],
-    )
+    resp = _create(client, model, 3000,
+                   blocks + [{"type": "text", "text": prompt}])
     _track_usage(model, resp)
     raw = _text_of(resp)
     try:
@@ -595,6 +592,30 @@ def _targeting_prompt(case_docs: list) -> str:
         "5. target_confidence נפרד מ-confidence: אפשר לזהות מסמך בוודאות מלאה "
         "ועדיין לא לדעת לאיזה פריט הוא שייך.\n\n"
     )
+
+
+def _create(client: Anthropic, model: str, max_tokens: int, content: list):
+    """קריאה למודל עם ניסיון לכבות חשיבה פנימית.
+
+    למה: המשימה כאן היא חילוץ שדות ממסמך, לא בעיה שדורשת מחשבה. כשהחשיבה
+    פעילה היא נספרת כטוקני פלט - כלומר עולה כסף - ובמקרה אחד היא בלעה את כל
+    תקרת האורך והתשובה חזרה ריקה לגמרי.
+
+    אם הפרמטר אינו נתמך, נופלים חזרה לקריאה רגילה. התוצאה נשמרת כדי שלא
+    ננסה שוב בכל קריאה.
+    """
+    msgs = [{"role": "user", "content": content}]
+    if st.session_state.get("no_thinking_param") is not True:
+        try:
+            resp = client.messages.create(
+                model=model, max_tokens=max_tokens, messages=msgs,
+                thinking={"type": "disabled"},
+            )
+            st.session_state["no_thinking_param"] = False
+            return resp
+        except Exception:
+            st.session_state["no_thinking_param"] = True
+    return client.messages.create(model=model, max_tokens=max_tokens, messages=msgs)
 
 
 def _text_of(resp) -> str:
@@ -688,10 +709,7 @@ def group_files(client: Anthropic, model: str, per_file: list, naming_rules: str
         "(ואם אין – לפי תאריך). target_index ריק פירושו שאין התאמה.\n\n"
     )
     try:
-        resp = client.messages.create(
-            model=model, max_tokens=16000,
-            messages=[{"role": "user", "content": [{"type": "text", "text": prompt}]}],
-        )
+        resp = _create(client, model, 16000, [{"type": "text", "text": prompt}])
         _track_usage(model, resp)
         raw = _text_of(resp)
         stop = getattr(resp, "stop_reason", None)
@@ -719,10 +737,7 @@ def group_files(client: Anthropic, model: str, per_file: list, naming_rules: str
                 + _targeting_prompt(case_docs) +
                 "הקבצים:\n" + json.dumps(payload, ensure_ascii=False, indent=1)
             )
-            resp2 = client.messages.create(
-                model=model, max_tokens=16000,
-                messages=[{"role": "user", "content": [{"type": "text", "text": retry}]}],
-            )
+            resp2 = _create(client, model, 16000, [{"type": "text", "text": retry}])
             _track_usage(model, resp2)
             raw2 = _text_of(resp2)
             st.session_state["last_group_raw"] = raw + "\n\n=== ניסיון חוזר ===\n" + raw2
@@ -932,6 +947,19 @@ if "results" not in st.session_state:
     st.session_state["results"] = None  # התוצאות האחרונות
 
 
+# סוגי מסמכים שיש להם מנפיק מובהק, ושבלעדיו הקיבוץ מתפצל בטעות
+_SOURCE_HINTS = ("תלוש", "שכר", "משכורת", "עו״ש", 'עו"ש', "עובר ושב",
+                 "תנועות", "חשבון", "בנק", "יתרות", "משכנת")
+
+
+def _needs_source(a: dict) -> bool:
+    """האם חסר שם המנפיק במסמך שבו הוא קריטי לקיבוץ."""
+    if (a.get("source") or "").strip():
+        return False
+    dt = (a.get("doc_type") or "")
+    return any(h in dt for h in _SOURCE_HINTS)
+
+
 def analyze_cached(client, model, name, data, only_edges, case_docs=None):
     """קורא קובץ, אבל אם כבר נקרא בעבר – מחזיר מהזיכרון בלי לשלם שוב.
 
@@ -981,10 +1009,13 @@ if run:
             a, hit = analyze_cached(client, CHEAP_MODEL, f["filename"], f["bytes"],
                                     only_edges, case_docs)
             used = "זול"
-            # שדרוג גם כשלא חולץ שם אדם: זה סימן מובהק לקריאה כושלת, גם אם
-            # המודל דיווח ביטחון גבוה. בלי שם אין שיוך אפשרי בתיק זוגי.
+            # שדרוג גם כשחסר מידע מזהה, גם אם הביטחון גבוה. שני שדות קריטיים:
+            # שם האדם - בלעדיו אין שיוך אפשרי בתיק זוגי; ושם המעסיק/הבנק
+            # במסמכים שיש להם מנפיק - בלעדיו הקיבוץ לא יודע שתלושים מאותו
+            # מקום שייכים יחד, ומפצל מסמך אחד לכמה.
             if (float(a.get("confidence") or 0) < threshold
-                    or not (a.get("person_name") or "").strip()):
+                    or not (a.get("person_name") or "").strip()
+                    or _needs_source(a)):
                 a, hit2 = analyze_cached(client, PRECISE_MODEL, f["filename"], f["bytes"],
                                          only_edges, case_docs)
                 used, hit = "שודרג לסונט", hit and hit2
