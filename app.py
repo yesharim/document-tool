@@ -17,6 +17,7 @@
 """
 
 import io
+import re
 import json
 import hashlib
 import base64
@@ -40,7 +41,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-TOOL_BUILD = "sorter-2026-09-16-v6"         # גרסת כלי המיון (נפרד מ-BUILD של המנוע)
+TOOL_BUILD = "sorter-2026-09-16-v7"         # גרסת כלי המיון (נפרד מ-BUILD של המנוע)
 
 CHEAP_MODEL = "claude-haiku-4-5-20251001"   # דגם זול לקריאה
 PRECISE_MODEL = "claude-sonnet-5"           # דגם מדויק לשדרוג ולקיבוץ
@@ -53,6 +54,22 @@ UNMATCHED_LABEL = "מסמכים נוספים"
 DPI_BROKEN_TEXT = 150
 DPI_GOOD_TEXT = 110
 MAX_PAGES = 8
+
+# מחירון ברירת מחדל, דולר למיליון טוקנים (קלט/פלט). ניתן לעדכון בסרגל הצד.
+DEFAULT_PRICES = {
+    CHEAP_MODEL: (1.00, 5.00),     # Haiku 4.5
+    PRECISE_MODEL: (2.00, 10.00),  # Sonnet 5
+}
+
+# הנחיה שחוזרת בשני המעברים: שמות ישראליים רבים מכילים גרש כפול רגיל
+# (בע\u05F4מ, עו\u05F4ש, רו\u05F4ח). כשהמודל מעתיק אותם כמות שהם לתוך ערך JSON,
+# הגרש סוגר את המחרוזת והפענוח נשבר באמצע המילה.
+_JSON_QUOTE_GUARD = (
+    '\n\nחשוב לפורמט: בתוך ערכי המחרוזות אל תשתמש בגרש כפול רגיל. '
+    'שם שמכיל בע\u05F4מ, עו\u05F4ש או רו\u05F4ח - כתוב עם גרשיים עבריים '
+    '(\u05F4) ולא עם תו הגרש הכפול הרגיל, שהוא תו מבנה ב-JSON ושובר את הפענוח.'
+)
+
 
 IMAGE_MIME = {
     "jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
@@ -158,13 +175,20 @@ def _extract_json(text: str):
     raise ValueError("no json")
 
 
+# גרש כפול רגיל שנמצא בין שתי אותיות עבריות הוא חלק מהמילה (בע"מ, עו"ש,
+# רו"ח, ש"ח) ולא סוגר מחרוזת JSON. בלי התיקון הזה כל מסמך שמכיל שם חברה עם
+# בע"מ מפיל את הפענוח. מחליפים אותו בגרשיים עבריים, שאינם תו JSON.
+_HEB_QUOTE = re.compile(r'(?<=[\u0590-\u05FF])"(?=[\u0590-\u05FF])')
+
+
 def _clean_json(text: str) -> str:
     text = text.strip()
     if text.startswith("```"):
         text = text.split("```", 2)[1]
         if text.lstrip().lower().startswith("json"):
             text = text.lstrip()[4:]
-    return text.strip().strip("`").strip()
+    text = text.strip().strip("`").strip()
+    return _HEB_QUOTE.sub("\u05F4", text)
 
 
 def reading_bytes(name: str, data: bytes, only_edges: bool) -> bytes:
@@ -268,6 +292,22 @@ def _file_blocks(name: str, data: bytes, only_edges: bool) -> tuple:
                 "מסמך (נפילה חזרה)")
 
 
+def _track_usage(model: str, resp) -> None:
+    """צובר טוקנים בפועל מתשובת השרת.
+
+    נספרים רק קריאות אמיתיות; קובץ שנשלף מהזיכרון לא עובר כאן, כי לא שולם
+    עליו. המספרים מגיעים מהשרת עצמו ולא מאומדן שלנו.
+    """
+    u = getattr(resp, "usage", None)
+    if u is None:
+        return
+    st.session_state.setdefault("usage", {})
+    d = st.session_state["usage"].setdefault(model, {"in": 0, "out": 0, "calls": 0})
+    d["in"] += getattr(u, "input_tokens", 0) or 0
+    d["out"] += getattr(u, "output_tokens", 0) or 0
+    d["calls"] += 1
+
+
 def _case_context_block(case_docs: list) -> str:
     """טקסט הקשר קצר למעבר 1: מה התיק מחכה לו. ריק אם אין רשימה."""
     if not case_docs:
@@ -316,6 +356,7 @@ def analyze_one(client: Anthropic, model: str, name: str, data: bytes,
         "והורד confidence, אל תנחש לפי שכיחות מילים.\n"
         "אם המסמך נראה כתלוש שכר (יש בו 'תלוש שכר לחודש', ברוטו, נטו, ניכויי "
         "חובה) - doc_type הוא תלוש שכר, גם אם מופיע בו מספר חשבון בנק."
+        + _JSON_QUOTE_GUARD
         + _case_context_block(case_docs)
     )
     resp = client.messages.create(
@@ -323,14 +364,18 @@ def analyze_one(client: Anthropic, model: str, name: str, data: bytes,
         messages=[{"role": "user",
                    "content": blocks + [{"type": "text", "text": prompt}]}],
     )
+    _track_usage(model, resp)
     raw = "".join(b.text for b in resp.content if b.type == "text")
     try:
         parsed = json.loads(_clean_json(raw))
         for k in FIELDS:
             if k in parsed and parsed[k] is not None:
                 result[k] = parsed[k]
-    except Exception:
-        result["summary"] = "לא ניתן לפענח את המסמך"
+    except Exception as e:
+        # חושפים את הסיבה במקום להבליע: בלי זה הקובץ יוצא "אחר / 0.0" בלי הסבר,
+        # וזו בדיוק הסיטואציה שקשה לאבחן בה מה קרה.
+        result["summary"] = f"כשל בפענוח התשובה: {type(e).__name__}"
+        result["raw_error"] = raw[:400]
     return result
 
 
@@ -425,7 +470,8 @@ def group_files(client: Anthropic, model: str, per_file: list, naming_rules: str
         "החזר JSON בלבד, בלי טקסט מסביב:\n"
         '{"groups": [{"indices": [0,1], "doc_type": "...", "final_name": "שם לפי הכללים", '
         '"confidence": 0.9, "target_index": 2, "target_confidence": 0.9, "note": ""}]}\n'
-        "כל קובץ חייב להופיע בקבוצה אחת בדיוק. סדר את ה-indices לפי page_num (ואם אין – לפי תאריך).\n\n"
+        "כל קובץ חייב להופיע בקבוצה אחת בדיוק. סדר את ה-indices לפי page_num (ואם אין – לפי תאריך).\n"
+        + _JSON_QUOTE_GUARD + "\n\n"
         "הקבצים:\n" + json.dumps(payload, ensure_ascii=False, indent=1)
     )
     try:
@@ -433,6 +479,7 @@ def group_files(client: Anthropic, model: str, per_file: list, naming_rules: str
             model=model, max_tokens=8000,
             messages=[{"role": "user", "content": [{"type": "text", "text": prompt}]}],
         )
+        _track_usage(model, resp)
         raw = "".join(b.text for b in resp.content if b.type == "text")
         stop = getattr(resp, "stop_reason", None)
         groups = _extract_json(raw).get("groups", [])
@@ -554,6 +601,42 @@ with st.sidebar:
 
     st.divider()
     naming_rules = st.text_area("כללי מתן-שמות (ניתן לעריכה)", DEFAULT_NAMING_RULES, height=300)
+
+    st.divider()
+    st.subheader("עלות")
+    with st.expander("מחירון (דולר למיליון טוקנים)"):
+        st.caption("ברירת המחדל נכונה לספטמבר 2026. אם המחירים ישתנו – עדכני כאן.")
+        p_cheap_in = st.number_input("דגם זול – קלט", value=DEFAULT_PRICES[CHEAP_MODEL][0],
+                                     step=0.25, format="%.2f")
+        p_cheap_out = st.number_input("דגם זול – פלט", value=DEFAULT_PRICES[CHEAP_MODEL][1],
+                                      step=0.25, format="%.2f")
+        p_prec_in = st.number_input("דגם מדויק – קלט", value=DEFAULT_PRICES[PRECISE_MODEL][0],
+                                    step=0.25, format="%.2f")
+        p_prec_out = st.number_input("דגם מדויק – פלט", value=DEFAULT_PRICES[PRECISE_MODEL][1],
+                                     step=0.25, format="%.2f")
+    prices = {CHEAP_MODEL: (p_cheap_in, p_cheap_out),
+              PRECISE_MODEL: (p_prec_in, p_prec_out)}
+
+    usage = st.session_state.get("usage", {})
+    if usage:
+        rows, total = [], 0.0
+        for mdl, d in usage.items():
+            pin, pout = prices.get(mdl, (0.0, 0.0))
+            cost = d["in"] / 1e6 * pin + d["out"] / 1e6 * pout
+            total += cost
+            rows.append({"דגם": "זול" if mdl == CHEAP_MODEL else "מדויק",
+                         "קריאות": d["calls"],
+                         "קלט": f'{d["in"]:,}', "פלט": f'{d["out"]:,}',
+                         "עלות": f"${cost:.4f}"})
+        st.markdown(html_table(rows), unsafe_allow_html=True)
+        st.metric("סה\u05F4כ בהפעלה הזו", f"${total:.3f}")
+        st.caption("נספרות רק קריאות בפועל. קבצים מהזיכרון לא עולים כלום.")
+        if st.button("אפס מונה עלות"):
+            st.session_state["usage"] = {}
+            st.rerun()
+    else:
+        st.caption("עוד לא בוצעו קריאות בהפעלה הזו.")
+
     st.caption(f"גרסת כלי: {TOOL_BUILD}")
 
 uploaded = st.file_uploader(
