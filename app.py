@@ -41,7 +41,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-TOOL_BUILD = "sorter-2026-09-16-v21"         # גרסת כלי המיון (נפרד מ-BUILD של המנוע)
+TOOL_BUILD = "sorter-2026-09-16-v22"         # גרסת כלי המיון (נפרד מ-BUILD של המנוע)
 
 CHEAP_MODEL = "claude-haiku-4-5-20251001"   # דגם זול לקריאה
 PRECISE_MODEL = "claude-sonnet-5"           # דגם מדויק לשדרוג ולקיבוץ
@@ -717,7 +717,14 @@ def group_files(client: Anthropic, model: str, per_file: list, naming_rules: str
         "אחת, שתמוזג לקובץ אחד. הכלל של 'טווחי תאריכים שונים = מסמכים נפרדים' "
         "אינו חל עליהם.\n"
         "לעומת זאת תלושים של שני אנשים שונים לעולם לא באותה קבוצה.\n"
-        "חוק ברזל: לעולם אל תשים באותה קבוצה מסמכים של שני אנשים שונים.\n"
+        "חוק ברזל א: לעולם אל תשים באותה קבוצה מסמכים של שני אנשים שונים.\n"
+        "חוק ברזל ב: לעולם אל תשים באותה קבוצה מסמכים משני מנפיקים שונים "
+        "(source שונה) - שני מעסיקים שונים, שני בנקים שונים. אדם אחד יכול "
+        "לעבוד בשני מקומות באותו חודש, ואלה שני מסמכים נפרדים שכל אחד מהם "
+        "מקבל קובץ משלו. אם source של אחד ריק ושל השני מלא - אל תניח שהם "
+        "זהים; השאר אותם בנפרד.\n"
+        "שני מסמכים נפרדים יכולים להיות משויכים לאותו סאב-אייטם. זה תקין "
+        "ואינו סיבה לאחד אותם.\n"
         "שם האדם מופיע לרוב רק בדף הראשון; אם דף אחד בקבוצה מכיל person_name – הוא תקף לכל הקבוצה.\n"
         "בשם הקובץ: קח את התאריך המוקדם ביותר ואת המאוחר ביותר מכל דפי הקבוצה.\n"
         "אם המסמך ברור – תן confidence גבוה (0.8-1). הורד רק אם באמת לא ברור.\n\n"
@@ -893,6 +900,14 @@ def render_cost_panel(prices: dict, slot=None) -> None:
     box.markdown(html_table(rows), unsafe_allow_html=True)
     box.caption("המספרים מדווחים על ידי השרת ולא מאומדן. קבצים שנשלפו "
                 "מהזיכרון אינם נספרים - לא שולם עליהם.")
+
+    cv = st.session_state.get("call_variant_desc")
+    if cv:
+        if "temperature" in cv:
+            box.success(f"מצב קריאה: {cv} — תשובות יציבות בין הרצות")
+        else:
+            box.warning(f"מצב קריאה: {cv} — בלי temperature. התשובות עלולות "
+                        "להשתנות בין הרצות על אותם קבצים.")
     if box.button("אפס מונה עלות"):
         st.session_state["usage"] = {}
         st.rerun()
@@ -978,13 +993,6 @@ with st.sidebar:
     cost_slot = st.empty()
 
     st.caption(f"גרסת כלי: {TOOL_BUILD}")
-    _cv = st.session_state.get("call_variant_desc")
-    if _cv:
-        st.caption(f"מצב קריאה מול השרת: {_cv}")
-        if "temperature" not in _cv:
-            st.warning("שימי לב: הספרייה שמותקנת לא מקבלת temperature, ולכן "
-                       "התשובות עלולות להשתנות בין הרצות על אותם קבצים. "
-                       "כדאי לנעול גרסה של anthropic בקובץ requirements.")
 
 uploaded = st.file_uploader(
     "גררי לכאן את כל הקבצים של הלקוח",
