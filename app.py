@@ -41,7 +41,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-TOOL_BUILD = "sorter-2026-09-16-v17"         # גרסת כלי המיון (נפרד מ-BUILD של המנוע)
+TOOL_BUILD = "sorter-2026-09-16-v19"         # גרסת כלי המיון (נפרד מ-BUILD של המנוע)
 
 CHEAP_MODEL = "claude-haiku-4-5-20251001"   # דגם זול לקריאה
 PRECISE_MODEL = "claude-sonnet-5"           # דגם מדויק לשדרוג ולקיבוץ
@@ -504,6 +504,12 @@ def analyze_one(client: Anthropic, model: str, name: str, data: bytes,
         "confidence, אל תנחש לפי שכיחות מילים.\n"
         "מסמך שיש בו תלוש שכר לחודש, ברוטו, נטו וניכויי חובה - הוא תלוש שכר, "
         "גם אם מופיע בו מספר חשבון בנק.\n"
+        "אל תבלבל בין תלוש שכר לדוח תנועות בנק. תלוש שכר מתאר משכורת של חודש "
+        "אחד: יש בו 'תלוש שכר לחודש', פירוט תשלומים, ברוטו, נטו וניכויי חובה, "
+        "והוא מונפק על ידי מעסיק. דוח תנועות מתאר חשבון בנק לאורך תקופה: יש בו "
+        "שורות של תנועות עם תאריך, חובה, זכות ויתרה מצטברת, והוא מונפק על ידי "
+        "בנק. מסמך שמופיעים בו ברוטו ונטו הוא תלוש, גם אם מופיעים בו מספר "
+        "חשבון ושם בנק - שם הבנק שם הוא רק לצורך העברת המשכורת.\n"
         "בתלוש שכר, שם העובד יושב בראש המסמך, ליד מספר העובד ומספר הזהות, "
         "ולצדו כתובת המגורים. תלושים ממעסיקים שונים בנויים אחרת זה מזה, אבל "
         "בכולם זה המקום. שמות שמופיעים בחתימה, בברכה, בכותרת תחתונה, בפרטי "
@@ -605,17 +611,22 @@ def _create(client: Anthropic, model: str, max_tokens: int, content: list):
     ננסה שוב בכל קריאה.
     """
     msgs = [{"role": "user", "content": content}]
+    # temperature=0: המשימה היא חילוץ שדות ממסמך, ויש לה תשובה אחת נכונה.
+    # בלי זה המודל נותן תשובה שונה בכל הרצה על אותו קלט בדיוק - אותו קובץ
+    # יוצא פעם תלוש שכר ופעם דוח תנועות. זו הייתה הסיבה העיקרית לחוסר
+    # היציבות בין הרצות, ולא הפורמט.
     if st.session_state.get("no_thinking_param") is not True:
         try:
             resp = client.messages.create(
                 model=model, max_tokens=max_tokens, messages=msgs,
-                thinking={"type": "disabled"},
+                temperature=0, thinking={"type": "disabled"},
             )
             st.session_state["no_thinking_param"] = False
             return resp
         except Exception:
             st.session_state["no_thinking_param"] = True
-    return client.messages.create(model=model, max_tokens=max_tokens, messages=msgs)
+    return client.messages.create(model=model, max_tokens=max_tokens,
+                                  messages=msgs, temperature=0)
 
 
 def _text_of(resp) -> str:
@@ -880,8 +891,14 @@ with st.sidebar:
     if not api_key:
         api_key = st.text_input("מפתח גישה (Anthropic API Key)", type="password")
 
-    mode = st.radio("מצב קריאה",
-                    ["חסכוני (זול + שדרוג בעת ספק)", "מדויק (סונט לכל הקבצים)"], index=0)
+    mode = st.radio(
+        "מצב קריאה",
+        ["מדויק — הדגם החזק לכל הקבצים (מומלץ)",
+         "חסכוני — דגם זול עם שדרוג בעת ספק"],
+        index=0,
+        help="מצב חסכוני חוסך כחמישה דולר בחודש, אבל הדגם הזול טועה במסמכים "
+             "קשים ומדווח ביטחון גבוה על תשובה שגויה. השארי על מדויק.",
+    )
     economical = mode.startswith("חסכוני")
 
     only_edges = st.checkbox("ב-PDF לקרוא רק תחילת המסמך + עמוד אחרון (חוסך)",
@@ -952,6 +969,19 @@ _SOURCE_HINTS = ("תלוש", "שכר", "משכורת", "עו״ש", 'עו"ש', "�
                  "תנועות", "חשבון", "בנק", "יתרות", "משכנת")
 
 
+def _is_hard_read(name: str, data: bytes, only_edges: bool) -> bool:
+    """האם הקובץ חייב קריאה ויזואלית מלאה (שכבת טקסט שבורה או סרוק)."""
+    if not name.lower().endswith(".pdf"):
+        return False
+    try:
+        d = fitz.open(stream=data, filetype="pdf")
+        verdict = _text_layer_verdict(d)
+        d.close()
+        return verdict == "broken"
+    except Exception:
+        return False
+
+
 def _needs_source(a: dict) -> bool:
     """האם חסר שם המנפיק במסמך שבו הוא קריטי לקיבוץ."""
     if (a.get("source") or "").strip():
@@ -1005,7 +1035,11 @@ if run:
     per_file, from_cache = [], 0
     prog = st.progress(0.0, text="קורא קבצים...")
     for i, f in enumerate(files):
-        if economical:
+        # קובץ שאין לו שכבת טקסט תקינה חייב להיקרא כולו בעיניים, וזו המשימה
+        # הקשה ביותר בערימה. הדגם הזול נכשל בה שוב ושוב - ומדווח ביטחון גבוה
+        # על תשובה שגויה - ולכן הוא לא משתתף בה בכלל.
+        hard = _is_hard_read(f["filename"], f["bytes"], only_edges)
+        if economical and not hard:
             a, hit = analyze_cached(client, CHEAP_MODEL, f["filename"], f["bytes"],
                                     only_edges, case_docs)
             used = "זול"
@@ -1022,7 +1056,7 @@ if run:
         else:
             a, hit = analyze_cached(client, PRECISE_MODEL, f["filename"], f["bytes"],
                                     only_edges, case_docs)
-            used = "סונט"
+            used = "סונט (טקסט שבור)" if hard else "סונט"
         from_cache += 1 if hit else 0
         per_file.append({"filename": f["filename"], "bytes": f["bytes"], "a": a,
                          "used": used,
