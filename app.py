@@ -41,7 +41,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-TOOL_BUILD = "sorter-2026-09-16-v7"         # גרסת כלי המיון (נפרד מ-BUILD של המנוע)
+TOOL_BUILD = "sorter-2026-09-16-v8"         # גרסת כלי המיון (נפרד מ-BUILD של המנוע)
 
 CHEAP_MODEL = "claude-haiku-4-5-20251001"   # דגם זול לקריאה
 PRECISE_MODEL = "claude-sonnet-5"           # דגם מדויק לשדרוג ולקיבוץ
@@ -239,6 +239,19 @@ def _render(page, dpi: int, cap: int = 1568) -> bytes:
     return pix.tobytes("png")
 
 
+def file_page_count(name: str, data: bytes) -> int:
+    """מספר העמודים האמיתי בקובץ. נמדד מקומית, בלי לשאול את המודל."""
+    if not name.lower().endswith(".pdf"):
+        return 1
+    try:
+        d = fitz.open(stream=data, filetype="pdf")
+        n = d.page_count
+        d.close()
+        return n
+    except Exception:
+        return 1
+
+
 def _file_blocks(name: str, data: bytes, only_edges: bool) -> tuple:
     """בונה את הבלוקים לשליחה. מחזיר (בלוקים, תיאור_מצב_הקריאה).
 
@@ -266,8 +279,11 @@ def _file_blocks(name: str, data: bytes, only_edges: bool) -> tuple:
     try:
         doc = fitz.open(stream=data, filetype="pdf")
         n = doc.page_count
-        idxs = [0, n - 1] if (only_edges and n > 2) else list(range(n))
-        idxs = idxs[:MAX_PAGES]
+        # במצב חסכוני קוראים את שני העמודים הראשונים ואת האחרון. עמוד ראשון
+        # לבדו לא מספיק: במסמכים ארוכים (שומה, הסכם) הוא לעתים דף שער או נספח,
+        # וזיהוי לפיו בלבד מטעה.
+        idxs = sorted({0, 1, n - 1}) if (only_edges and n > 3) else list(range(n))
+        idxs = [i for i in idxs if 0 <= i < n][:MAX_PAGES]
 
         verdict = _text_layer_verdict(doc)
         dpi = DPI_BROKEN_TEXT if verdict == "broken" else DPI_GOOD_TEXT
@@ -340,7 +356,8 @@ def analyze_one(client: Anthropic, model: str, name: str, data: bytes,
         '"property_address": "כתובת נכס אם רלוונטי או null", '
         '"person_name": "השם הפרטי של האדם/הלקוח שהמסמך שייך לו, או null", '
         '"business_name": "שם עסק/חברה אם רלוונטי או null", '
-        '"page_num": מספר הדף הנוכחי אם מופיע מספור (למשל "דף 2 מתוך 5" / "עמוד 2 מתוך 4" / "1/2") אחרת null, '
+        '"page_num": מספר הדף של העמוד הראשון שקיבלת, לפי המספור המודפס במסמך '
+        '(למשל "דף 2 מתוך 5" / "עמוד 2 מתוך 4" / "1/2"), אחרת null, '
         '"page_total": סך הדפים באותו מספור, אחרת null, '
         '"balance_start": יתרת הפתיחה בדף (מספר) אם זה דף תנועות עו״ש, אחרת null, '
         '"balance_end": יתרת הסגירה בדף (מספר) אם זה דף תנועות עו״ש, אחרת null, '
@@ -355,7 +372,9 @@ def analyze_one(client: Anthropic, model: str, name: str, data: bytes,
         "והן אינן מעידות על מנפיק הדוח. אם הלוגו לא קריא - השאר source ריק "
         "והורד confidence, אל תנחש לפי שכיחות מילים.\n"
         "אם המסמך נראה כתלוש שכר (יש בו 'תלוש שכר לחודש', ברוטו, נטו, ניכויי "
-        "חובה) - doc_type הוא תלוש שכר, גם אם מופיע בו מספר חשבון בנק."
+        "חובה) - doc_type הוא תלוש שכר, גם אם מופיע בו מספר חשבון בנק.\n"
+        "\nייתכן שקיבלת כמה תמונות של אותו קובץ. page_num מתייחס תמיד לעמוד "
+        "הראשון שקיבלת, לא לאחרון."
         + _JSON_QUOTE_GUARD
         + _case_context_block(case_docs)
     )
@@ -450,7 +469,9 @@ def group_files(client: Anthropic, model: str, per_file: list, naming_rules: str
     """
     case_docs = case_docs or []
     payload = [
-        {"index": i, "filename": f["filename"], **{k: f["a"].get(k) for k in FIELDS}}
+        {"index": i, "filename": f["filename"],
+         "file_pages": f.get("file_pages", 1),
+         **{k: f["a"].get(k) for k in FIELDS if k != "read_mode"}}
         for i, f in enumerate(per_file)
     ]
     prompt = (
@@ -460,7 +481,15 @@ def group_files(client: Anthropic, model: str, per_file: list, naming_rules: str
         "ואותו סוג ומקור – זה מסמך אחד, וכל הדפים 1..page_total שייכים לו.\n"
         "2. אותו סוג מסמך + אותו מקור (בנק) + אותו מספר חשבון.\n"
         "3. תאריכים רציפים או חופפים.\n\n"
+        "file_pages = מספר העמודים האמיתי בקובץ, נמדד ולא משוער. אם file_pages "
+        "שווה ל-page_total, הקובץ שלם ואין עמודים חסרים - אל תדווח חוסר.\n"
         "שים לב: שני מסמכים מאותו בנק אך בטווחי תאריכים שונים = שני מסמכים נפרדים.\n"
+        "חריג חשוב - מסמכים תקופתיים שנדרשים כסדרה: תלושי שכר, וכן כל מסמך "
+        "שהסאב-אייטם מבקש ממנו כמה חודשים ('3 חודשים אחרונים'). תלושים של אותו "
+        "אדם ואותו מעסיק בחודשים עוקבים הם מסמך לוגי אחד ויש לאחד אותם לקבוצה "
+        "אחת, שתמוזג לקובץ אחד. הכלל של 'טווחי תאריכים שונים = מסמכים נפרדים' "
+        "אינו חל עליהם.\n"
+        "לעומת זאת תלושים של שני אנשים שונים לעולם לא באותה קבוצה.\n"
         "חוק ברזל: לעולם אל תשים באותה קבוצה מסמכים של שני אנשים שונים.\n"
         "שם האדם מופיע לרוב רק בדף הראשון; אם דף אחד בקבוצה מכיל person_name – הוא תקף לכל הקבוצה.\n"
         "בשם הקובץ: קח את התאריך המוקדם ביותר ואת המאוחר ביותר מכל דפי הקבוצה.\n"
@@ -551,6 +580,30 @@ def html_table(rows: list) -> str:
     )
 
 
+def render_cost_panel(prices: dict) -> None:
+    """מצייר את מד העלות. חייב להיקרא באזור התוצאות ולא בסרגל הצד:
+    סרגל הצד מצויר לפני שההרצה מתחילה, ולכן המונה שם עדיין ריק."""
+    usage = st.session_state.get("usage", {})
+    if not usage:
+        return
+    rows, total = [], 0.0
+    for mdl, d in usage.items():
+        pin, pout = prices.get(mdl, (0.0, 0.0))
+        cost = d["in"] / 1e6 * pin + d["out"] / 1e6 * pout
+        total += cost
+        rows.append({"דגם": "זול" if mdl == CHEAP_MODEL else "מדויק",
+                     "קריאות": d["calls"],
+                     "טוקני קלט": f'{d["in"]:,}', "טוקני פלט": f'{d["out"]:,}',
+                     "עלות": f"${cost:.4f}"})
+    with st.expander(f"💰 עלות מצטברת בהפעלה הזו: ${total:.3f}", expanded=True):
+        st.markdown(html_table(rows), unsafe_allow_html=True)
+        st.caption("המספרים מדווחים על ידי השרת, לא מאומדן. קבצים שנשלפו "
+                   "מהזיכרון אינם נספרים - לא שולם עליהם.")
+        if st.button("אפס מונה עלות"):
+            st.session_state["usage"] = {}
+            st.rerun()
+
+
 def safe_filename(name: str) -> str:
     for ch in '\\/:*?"<>|':
         name = name.replace(ch, "-")
@@ -576,7 +629,10 @@ with st.sidebar:
                     ["חסכוני (זול + שדרוג בעת ספק)", "מדויק (סונט לכל הקבצים)"], index=0)
     economical = mode.startswith("חסכוני")
 
-    only_edges = st.checkbox("ב-PDF לקרוא רק עמוד ראשון + אחרון (חוסך)", value=True)
+    only_edges = st.checkbox("ב-PDF לקרוא רק תחילת המסמך + עמוד אחרון (חוסך)",
+                             value=True,
+                             help="קורא שני עמודים ראשונים ואת האחרון. כבי את זה "
+                                  "אם מסמכים ארוכים מזוהים לפי נספח במקום לפי גופם.")
     st.caption("קריאת PDF ויזואלית ואוטומטית: הכלי מאבחן לבד את שכבת הטקסט "
                "ובוחר דיוק בהתאם. אין מה להגדיר.")
     threshold = st.slider("סף ביטחון (מתחתיו: שדרוג לסונט, ואם עדיין נמוך – 'לבדיקה')",
@@ -616,26 +672,6 @@ with st.sidebar:
                                      step=0.25, format="%.2f")
     prices = {CHEAP_MODEL: (p_cheap_in, p_cheap_out),
               PRECISE_MODEL: (p_prec_in, p_prec_out)}
-
-    usage = st.session_state.get("usage", {})
-    if usage:
-        rows, total = [], 0.0
-        for mdl, d in usage.items():
-            pin, pout = prices.get(mdl, (0.0, 0.0))
-            cost = d["in"] / 1e6 * pin + d["out"] / 1e6 * pout
-            total += cost
-            rows.append({"דגם": "זול" if mdl == CHEAP_MODEL else "מדויק",
-                         "קריאות": d["calls"],
-                         "קלט": f'{d["in"]:,}', "פלט": f'{d["out"]:,}',
-                         "עלות": f"${cost:.4f}"})
-        st.markdown(html_table(rows), unsafe_allow_html=True)
-        st.metric("סה\u05F4כ בהפעלה הזו", f"${total:.3f}")
-        st.caption("נספרות רק קריאות בפועל. קבצים מהזיכרון לא עולים כלום.")
-        if st.button("אפס מונה עלות"):
-            st.session_state["usage"] = {}
-            st.rerun()
-    else:
-        st.caption("עוד לא בוצעו קריאות בהפעלה הזו.")
 
     st.caption(f"גרסת כלי: {TOOL_BUILD}")
 
@@ -712,7 +748,9 @@ if run:
                                     only_edges, case_docs)
             used = "סונט"
         from_cache += 1 if hit else 0
-        per_file.append({"filename": f["filename"], "bytes": f["bytes"], "a": a, "used": used})
+        per_file.append({"filename": f["filename"], "bytes": f["bytes"], "a": a,
+                         "used": used,
+                         "file_pages": file_page_count(f["filename"], f["bytes"])})
         prog.progress((i + 1) / len(files), text=f"נקרא: {f['filename']}")
     prog.progress(1.0, text="מקבץ ונותן שמות...")
 
@@ -785,6 +823,7 @@ R = st.session_state.get("results")
 if R:
     n_docs = len(R["ok"]) + len(R["review"]) + len(R.get("extra", []))
     st.success(f"עובדו {R['n_files']} קבצים → {n_docs} מסמכים.")
+    render_cost_panel(prices)
     if R["from_cache"]:
         st.caption(f"({R['from_cache']} קבצים נלקחו מהזיכרון – לא שולם עליהם שוב)")
     st.download_button("⬇️ הורד הכל (ZIP)", R["zip"], file_name="מסמכים_ממוינים.zip",
