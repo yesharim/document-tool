@@ -1,13 +1,19 @@
 # -*- coding: utf-8 -*-
 """
-כלי סיווג, קיבוץ ומתן-שמות למסמכים.
+כלי סיווג, קיבוץ, שיוך ומתן-שמות למסמכים.
 העובדת מעלה את כל הקבצים (PDF / תמונות), הכלי:
-  1) קורא כל קובץ עם הדגם הזול; אם לא בטוח – משדרג לדגם המדויק (מעבר 1)
-  2) מקבץ מסמכים שהם אותו דבר לוגי ונותן שם לפי הכללים (מעבר 2)
+  1) קורא כל קובץ עם הדגם הזול; אם לא בטוח - משדרג לדגם המדויק (מעבר 1)
+  2) מקבץ מסמכים שהם אותו דבר לוגי, משייך לסאב-אייטם ונותן שם (מעבר 2)
   3) ממזג כל קבוצה ל-PDF אחד עם השם הסופי
-  4) מסמן בנפרד מה שלא בטוח ("לבדיקה")
-הכלי מזהה את שם הלקוח בעצמו מתוך המסמכים – אין צורך להקליד כלום.
+  4) מסמן בנפרד מה שלא בטוח ("לבדיקה") ומה שלא שויך ("מסמכים נוספים")
+הכלי מזהה את שם הלקוח בעצמו מתוך המסמכים - אין צורך להקליד כלום.
 ההעלאה למונדיי נשארת ידנית.
+
+חדש בגרסה זו (הקשר התיק):
+  מדביקים בסרגל הצד את שמות הסאב-אייטמים הפתוחים של התיק. הרשימה עוברת
+  לשני המעברים: הראשון קורא עם ידיעה מה התיק מחכה לו, והשני בוחר יעד מתוך
+  תפריט סגור. "לא יודע" היא תשובה מותרת ומועדפת על ניחוש.
+  ללא רשימה - הכלי מתנהג בדיוק כמו קודם.
 """
 
 import io
@@ -34,8 +40,13 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+TOOL_BUILD = "sorter-2026-09-10-v3"         # גרסת כלי המיון (נפרד מ-BUILD של המנוע)
+
 CHEAP_MODEL = "claude-haiku-4-5-20251001"   # דגם זול לקריאה
 PRECISE_MODEL = "claude-sonnet-5"           # דגם מדויק לשדרוג ולקיבוץ
+
+# שם התיקייה/היעד לקבצים שלא שויכו לשום סאב-אייטם.
+UNMATCHED_LABEL = "מסמכים נוספים"
 
 IMAGE_MIME = {
     "jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
@@ -45,7 +56,12 @@ IMAGE_MIME = {
 FIELDS = {"doc_type": "אחר", "source": None, "date_start": None, "date_end": None,
           "period_label": None, "account_last3": None, "property_address": None,
           "person_name": None, "business_name": None, "page_num": None, "page_total": None,
+          "balance_start": None, "balance_end": None,
           "summary": "", "confidence": 0.0}
+
+# balance_start / balance_end נאספים כבר עכשיו לצורך בדיקת רצף עתידית:
+# אם יתרת הסגירה של דף אחד שווה ליתרת הפתיחה של הדף הבא - הרצף שלם, גם אם
+# יש תקופה בלי תנועות. אם היא קופצת - באמת חסר דף. הלוגיקה עצמה עוד לא נבנתה.
 
 # כללי מתן-שמות ברירת מחדל (ניתן לערוך במסך). מבוסס על טבלת "איך לקרוא לדוח".
 DEFAULT_NAMING_RULES = """בנה שם קובץ (בלי סיומת) לפי סוג המסמך, בסדר: מילת-סוג + מזהים.
@@ -176,7 +192,20 @@ def _file_block(name: str, data: bytes):
     return None
 
 
-def analyze_one(client: Anthropic, model: str, name: str, data: bytes) -> dict:
+def _case_context_block(case_docs: list) -> str:
+    """טקסט הקשר קצר למעבר 1: מה התיק מחכה לו. ריק אם אין רשימה."""
+    if not case_docs:
+        return ""
+    lines = "\n".join(f"- {d}" for d in case_docs)
+    return (
+        "\nהקשר: התיק שאליו שייך המסמך ממתין למסמכים הבאים:\n" + lines +
+        "\nהשתמש בהקשר כדי לדייק את הזיהוי, אך אל תכריח התאמה: אם המסמך אינו "
+        "אחד מהם - דווח מה שהוא באמת.\n"
+    )
+
+
+def analyze_one(client: Anthropic, model: str, name: str, data: bytes,
+                case_docs: list = None) -> dict:
     """מעבר 1 – קריאת קובץ בודד. מחזיר תמיד dict עם כל השדות."""
     result = dict(FIELDS)
     block = _file_block(name, data)
@@ -196,9 +225,14 @@ def analyze_one(client: Anthropic, model: str, name: str, data: bytes) -> dict:
         '"business_name": "שם עסק/חברה אם רלוונטי או null", '
         '"page_num": מספר הדף הנוכחי אם מופיע מספור (למשל "דף 2 מתוך 5" / "עמוד 2 מתוך 4" / "1/2") אחרת null, '
         '"page_total": סך הדפים באותו מספור, אחרת null, '
+        '"balance_start": יתרת הפתיחה בדף (מספר) אם זה דף תנועות עו״ש, אחרת null, '
+        '"balance_end": יתרת הסגירה בדף (מספר) אם זה דף תנועות עו״ש, אחרת null, '
         '"summary": "משפט קצר בעברית", '
         '"confidence": מספר בין 0 ל-1}\n'
-        "date_start/date_end = טווח התאריכים שבמסמך. אם יום בודד – שים אותו בשניהם."
+        "date_start/date_end = טווח התאריכים שבמסמך. אם יום בודד – שים אותו בשניהם.\n"
+        "balance_start/balance_end: היתרה בתחילת הדף ובסופו, כפי שמופיעות בדוח. "
+        "הן משמשות לבדיקת רצף בין דפים, אז דייק בהן."
+        + _case_context_block(case_docs)
     )
     resp = client.messages.create(
         model=model, max_tokens=700,
@@ -215,8 +249,64 @@ def analyze_one(client: Anthropic, model: str, name: str, data: bytes) -> dict:
     return result
 
 
-def group_files(client: Anthropic, model: str, per_file: list, naming_rules: str):
-    """מעבר 2 – קיבוץ ומתן-שמות (טקסט בלבד). מחזיר (קבוצות, שגיאה_אם_יש)."""
+def _attach_target(group: dict, case_docs: list) -> None:
+    """ממיר target_index למחרוזת השם המדויקת של הסאב-אייטם.
+
+    מוודא שהאינדקס תקין ובטווח. כל ערך אחר (null, מחוץ לטווח, לא מספר) הופך
+    ל-target=None, כלומר "מסמכים נוספים". עדיף לא לשייך מאשר לשייך לא נכון.
+    """
+    group.setdefault("note", "")
+    if not case_docs:
+        group["target"], group["target_conf"] = None, 0.0
+        return
+    idx = group.get("target_index")
+    try:
+        idx = int(idx)
+    except (TypeError, ValueError):
+        idx = None
+    if idx is None or not (0 <= idx < len(case_docs)):
+        group["target"], group["target_conf"] = None, 0.0
+        return
+    group["target"] = case_docs[idx]
+    try:
+        group["target_conf"] = float(group.get("target_confidence") or 0.0)
+    except (TypeError, ValueError):
+        group["target_conf"] = 0.0
+
+
+def _targeting_prompt(case_docs: list) -> str:
+    """הנחיית השיוך לסאב-אייטם. ריקה כשאין רשימה (אז הכלי מתנהג כמו קודם)."""
+    if not case_docs:
+        return ""
+    menu = "\n".join(f"{i}. {d}" for i, d in enumerate(case_docs))
+    return (
+        "שיוך לסאב-אייטם\n"
+        "התיק ממתין למסמכים הבאים, ממוספרים:\n" + menu + "\n\n"
+        "לכל קבוצה החזר target_index – המספר מהרשימה שאליו המסמך שייך, "
+        "ו-target_confidence בין 0 ל-1.\n"
+        "כללי השיוך:\n"
+        "1. ההתאמה היא לפי מהות, לא לפי מילים. השווה סוג מסמך, מוסד, ובעל המסמך.\n"
+        "2. שם הבנק ברשימה הוא השם הרשמי המלא (למשל 'בנק דיסקונט לישראל בע\"מ') "
+        "ובמסמך הוא לרוב מקוצר ('דיסקונט'). זו התאמה תקפה.\n"
+        "3. חוק ברזל: אם ברשימה יש כמה פריטים מאותו סוג שנבדלים בשם האדם או בבנק – "
+        "חייבים להתאים גם את השם וגם את הבנק. אל תבחר על סמך הסוג בלבד.\n"
+        "4. אם אין התאמה ברורה, או שיש שתי אפשרויות ואינך יכול להכריע – "
+        "החזר target_index: null. זו תשובה נכונה ועדיפה על ניחוש; "
+        "הקובץ יטופל ידנית. אל תכריח שיוך.\n"
+        "5. target_confidence נפרד מ-confidence: אפשר לזהות מסמך בוודאות מלאה "
+        "ועדיין לא לדעת לאיזה פריט הוא שייך.\n\n"
+    )
+
+
+def group_files(client: Anthropic, model: str, per_file: list, naming_rules: str,
+                case_docs: list = None):
+    """מעבר 2 – קיבוץ, שיוך לסאב-אייטם ומתן-שמות. מחזיר (קבוצות, שגיאה_אם_יש).
+
+    כשמועברת רשימת סאב-אייטמים (case_docs), כל קבוצה מקבלת גם target_index –
+    אינדקס מתוך הרשימה, או null אם אין התאמה ברורה. עבודה באינדקס ולא במחרוזת
+    מונעת אי-התאמות של ניסוח (למשל "בנק דיסקונט" מול "בנק דיסקונט לישראל בע״מ").
+    """
+    case_docs = case_docs or []
     payload = [
         {"index": i, "filename": f["filename"], **{k: f["a"].get(k) for k in FIELDS}}
         for i, f in enumerate(per_file)
@@ -234,9 +324,10 @@ def group_files(client: Anthropic, model: str, per_file: list, naming_rules: str
         "בשם הקובץ: קח את התאריך המוקדם ביותר ואת המאוחר ביותר מכל דפי הקבוצה.\n"
         "אם המסמך ברור – תן confidence גבוה (0.8-1). הורד רק אם באמת לא ברור.\n\n"
         f"{naming_rules}\n\n"
+        + _targeting_prompt(case_docs) +
         "החזר JSON בלבד, בלי טקסט מסביב:\n"
         '{"groups": [{"indices": [0,1], "doc_type": "...", "final_name": "שם לפי הכללים", '
-        '"confidence": 0.9, "note": ""}]}\n'
+        '"confidence": 0.9, "target_index": 2, "target_confidence": 0.9, "note": ""}]}\n'
         "כל קובץ חייב להופיע בקבוצה אחת בדיוק. סדר את ה-indices לפי page_num (ואם אין – לפי תאריך).\n\n"
         "הקבצים:\n" + json.dumps(payload, ensure_ascii=False, indent=1)
     )
@@ -257,12 +348,15 @@ def group_files(client: Anthropic, model: str, per_file: list, naming_rules: str
                 groups.append({"indices": [i], "doc_type": per_file[i]["a"].get("doc_type"),
                                "final_name": per_file[i]["filename"].rsplit(".", 1)[0],
                                "confidence": 0.0, "note": "לא שויך לקבוצה"})
+        for g in groups:
+            _attach_target(g, case_docs)
         err = "התשובה נחתכה באמצע – ייתכן שהקיבוץ חלקי." if stop == "max_tokens" else None
         return groups, err
     except Exception as e:
         fallback = [{"indices": [i], "doc_type": f["a"].get("doc_type", "אחר"),
                      "final_name": f["filename"].rsplit(".", 1)[0],
-                     "confidence": 0.0, "note": "לא ניתן לקבץ אוטומטית"}
+                     "confidence": 0.0, "target": None, "target_conf": 0.0,
+                     "note": "לא ניתן לקבץ אוטומטית"}
                     for i, f in enumerate(per_file)]
         return fallback, f"שלב הקיבוץ נכשל: {type(e).__name__}: {e}"
 
@@ -279,6 +373,38 @@ def merge_to_pdf(files_bytes: list, names: list) -> bytes:
     buf = out.tobytes()
     out.close()
     return buf
+
+
+def html_table(rows: list) -> str:
+    """בונה טבלה כ-HTML, בלי pandas ובלי st.dataframe.
+
+    כלל זהב בפרויקט: pandas / st.table / st.dataframe קרסו בפריסה. לכן כל
+    טבלה נבנית כאן. מקבל רשימת מילונים; מפתחות השורה הראשונה הם הכותרות.
+    """
+    if not rows:
+        return ""
+    heads = list(rows[0].keys())
+
+    def esc(v):
+        s = "" if v is None else str(v)
+        return (s.replace("&", "&amp;").replace("<", "&lt;")
+                 .replace(">", "&gt;").replace('"', "&quot;"))
+
+    th_style = "padding:6px 8px;text-align:right"
+    td_style = "padding:6px 8px;border-bottom:1px solid #e2e7ea"
+    th = "".join(f"<th style='{th_style}'>{esc(h)}</th>" for h in heads)
+    tr = "".join(
+        "<tr>" + "".join(f"<td style='{td_style}'>{esc(r.get(h))}</td>" for h in heads)
+        + "</tr>"
+        for r in rows
+    )
+    return (
+        "<div style='overflow-x:auto'>"
+        "<table style='width:100%;border-collapse:collapse;direction:rtl;"
+        "font-size:0.88rem'>"
+        "<thead><tr style='background:#0f2b3d;color:#fff'>" + th + "</tr></thead>"
+        "<tbody>" + tr + "</tbody></table></div>"
+    )
 
 
 def safe_filename(name: str) -> str:
@@ -309,8 +435,27 @@ with st.sidebar:
     only_edges = st.checkbox("ב-PDF לקרוא רק עמוד ראשון + אחרון (חוסך)", value=True)
     threshold = st.slider("סף ביטחון (מתחתיו: שדרוג לסונט, ואם עדיין נמוך – 'לבדיקה')",
                           0.0, 1.0, 0.7, 0.05)
+    match_threshold = st.slider("סף שיוך לסאב-אייטם (מתחתיו: 'מסמכים נוספים')",
+                                0.0, 1.0, 0.6, 0.05)
+    st.divider()
+
+    st.subheader("הקשר התיק")
+    st.caption("הדביקי את שמות הסאב-אייטמים הפתוחים של התיק, שורה לשורה. "
+               "אפשר להשאיר ריק – אז הכלי רק מסווג ולא משייך.")
+    case_docs_raw = st.text_area(
+        "סאב-אייטמים פתוחים",
+        placeholder=("תלושי שכר 3 חודשים אחרונים\n"
+                     "עובר ושב 3 חודשים — בנק דיסקונט לישראל בע\"מ\n"
+                     "אישור ניהול חשבון — בנק דיסקונט לישראל בע\"מ"),
+        height=170,
+    )
+    case_docs = [ln.strip() for ln in (case_docs_raw or "").splitlines() if ln.strip()]
+    if case_docs:
+        st.success(f"{len(case_docs)} מסמכים ברשימה")
+
     st.divider()
     naming_rules = st.text_area("כללי מתן-שמות (ניתן לעריכה)", DEFAULT_NAMING_RULES, height=300)
+    st.caption(f"גרסת כלי: {TOOL_BUILD}")
 
 uploaded = st.file_uploader(
     "גררי לכאן את כל הקבצים של הלקוח",
@@ -325,13 +470,18 @@ if "results" not in st.session_state:
     st.session_state["results"] = None  # התוצאות האחרונות
 
 
-def analyze_cached(client, model, name, data, only_edges):
-    """קורא קובץ, אבל אם כבר נקרא בעבר – מחזיר מהזיכרון בלי לשלם שוב."""
+def analyze_cached(client, model, name, data, only_edges, case_docs=None):
+    """קורא קובץ, אבל אם כבר נקרא בעבר – מחזיר מהזיכרון בלי לשלם שוב.
+
+    ההקשר נכנס למפתח הזיכרון: אותו קובץ תחת רשימת סאב-אייטמים שונה הוא קריאה
+    אחרת, ולכן אסור להחזיר תשובה ישנה שנקראה בלי ההקשר.
+    """
     rb = reading_bytes(name, data, only_edges)
-    key = hashlib.sha256(rb).hexdigest() + "|" + model
+    ctx = hashlib.sha256("|".join(case_docs or []).encode("utf-8")).hexdigest()[:12]
+    key = hashlib.sha256(rb).hexdigest() + "|" + model + "|" + ctx
     if key in st.session_state["cache"]:
         return st.session_state["cache"][key], True
-    a = analyze_one(client, model, name, rb)
+    a = analyze_one(client, model, name, rb, case_docs)
     st.session_state["cache"][key] = a
     return a, False
 
@@ -365,27 +515,30 @@ if run:
     prog = st.progress(0.0, text="קורא קבצים...")
     for i, f in enumerate(files):
         if economical:
-            a, hit = analyze_cached(client, CHEAP_MODEL, f["filename"], f["bytes"], only_edges)
+            a, hit = analyze_cached(client, CHEAP_MODEL, f["filename"], f["bytes"],
+                                    only_edges, case_docs)
             used = "זול"
             if float(a.get("confidence") or 0) < threshold:
-                a, hit2 = analyze_cached(client, PRECISE_MODEL, f["filename"], f["bytes"], only_edges)
+                a, hit2 = analyze_cached(client, PRECISE_MODEL, f["filename"], f["bytes"],
+                                         only_edges, case_docs)
                 used, hit = "שודרג לסונט", hit and hit2
         else:
-            a, hit = analyze_cached(client, PRECISE_MODEL, f["filename"], f["bytes"], only_edges)
+            a, hit = analyze_cached(client, PRECISE_MODEL, f["filename"], f["bytes"],
+                                    only_edges, case_docs)
             used = "סונט"
         from_cache += 1 if hit else 0
         per_file.append({"filename": f["filename"], "bytes": f["bytes"], "a": a, "used": used})
         prog.progress((i + 1) / len(files), text=f"נקרא: {f['filename']}")
     prog.progress(1.0, text="מקבץ ונותן שמות...")
 
-    groups, group_err = group_files(client, PRECISE_MODEL, per_file, naming_rules)
+    groups, group_err = group_files(client, PRECISE_MODEL, per_file, naming_rules, case_docs)
     if group_err:
         st.error(f"⚠️ {group_err}")
     prog.empty()
 
     # בניית קבצים ממוזגים
     zip_buf = io.BytesIO()
-    ok_groups, review_groups = [], []
+    ok_groups, review_groups, extra_groups = [], [], []
     with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
         for gi, g in enumerate(groups):
             idxs = g.get("indices", [])
@@ -402,14 +555,34 @@ if run:
                 conf = min((float(m["a"].get("confidence") or 0) for m in members), default=0.0)
             conf = float(conf)
 
-            folder = "לבדיקה/" if conf < threshold else ""
+            # שיוך: יעד מתקבל רק אם עבר את סף השיוך. אחרת – מסמכים נוספים.
+            target = g.get("target")
+            tconf = float(g.get("target_conf") or 0.0)
+            if target and tconf < match_threshold:
+                target = None
+
+            # סדר ההכרעה: ביטחון זיהוי נמוך גובר על הכל, כי אם לא יודעים מה
+            # המסמך – אין טעם לשייך אותו. אחר כך היעד, ולבסוף מסמכים נוספים.
+            if conf < threshold:
+                bucket, folder = "review", "לבדיקה/"
+            elif target:
+                bucket, folder = "ok", safe_filename(target) + "/"
+            else:
+                bucket, folder = "extra", UNMATCHED_LABEL + "/"
+
             zf.writestr(folder + fname, pdf)
             entry = {"name": fname, "pdf": pdf, "conf": conf, "note": g.get("note", ""),
+                     "target": target, "tconf": tconf,
                      "sources": [m["filename"] for m in members], "key": f"g{gi}"}
-            (review_groups if conf < threshold else ok_groups).append(entry)
+            {"ok": ok_groups, "review": review_groups, "extra": extra_groups}[bucket].append(entry)
+
+    # אילו סאב-אייטמים מהרשימה לא קיבלו אף מסמך – זה מה שעדיין חסר מהלקוח
+    covered = {e["target"] for e in ok_groups if e.get("target")}
+    still_missing = [d for d in case_docs if d not in covered]
 
     st.session_state["results"] = {
         "zip": zip_buf.getvalue(), "ok": ok_groups, "review": review_groups,
+        "extra": extra_groups, "missing": still_missing, "has_context": bool(case_docs),
         "table": [{"קובץ": m["filename"], "זוהה כ": m["a"].get("doc_type"),
                    "שם שזוהה": m["a"].get("person_name"),
                    "דף": (f'{m["a"].get("page_num")}/{m["a"].get("page_total")}'
@@ -424,7 +597,8 @@ if run:
 # --------------------------------------------------- הצגת תוצאות (נשמרות גם אחרי הורדה)
 R = st.session_state.get("results")
 if R:
-    st.success(f"עובדו {R['n_files']} קבצים → {len(R['ok']) + len(R['review'])} מסמכים.")
+    n_docs = len(R["ok"]) + len(R["review"]) + len(R.get("extra", []))
+    st.success(f"עובדו {R['n_files']} קבצים → {n_docs} מסמכים.")
     if R["from_cache"]:
         st.caption(f"({R['from_cache']} קבצים נלקחו מהזיכרון – לא שולם עליהם שוב)")
     st.download_button("⬇️ הורד הכל (ZIP)", R["zip"], file_name="מסמכים_ממוינים.zip",
@@ -433,12 +607,15 @@ if R:
     if R["economical"]:
         st.info(f"קריאה: {R['n_files'] - R['upgraded']} קבצים הסתדרו עם הדגם הזול, "
                 f"{R['upgraded']} שודרגו לסונט.")
-    st.dataframe(R["table"], use_container_width=True, hide_index=True)
+    st.markdown(html_table(R["table"]), unsafe_allow_html=True)
 
     def show(entry):
         cols = st.columns([3, 1])
         with cols[0]:
             st.markdown(f"**{entry['name']}**")
+            if entry.get("target"):
+                st.caption(f"↖ לסאב-אייטם: {entry['target']}  ·  ביטחון שיוך "
+                           f"{round(entry.get('tconf', 0), 2)}")
             st.caption(f"מ-{len(entry['sources'])} קבצים: {', '.join(entry['sources'])}")
             if entry["note"]:
                 st.caption(f"הערה: {entry['note']}")
@@ -447,10 +624,25 @@ if R:
                                mime="application/pdf", key=entry["key"])
 
     if R["ok"]:
-        st.subheader("✅ מוכן להעלאה")
+        st.subheader("✅ שויך ומוכן להעלאה")
         for e in R["ok"]:
             show(e)
+    if R.get("extra"):
+        st.subheader(f"📁 {UNMATCHED_LABEL} (זוהו, לא שויכו לסאב-אייטם)")
+        st.caption("מסמכים תקינים שאין להם יעד ברור ברשימה. "
+                   "לא ננחש – העלי אותם ידנית לאן שנכון.")
+        for e in R["extra"]:
+            show(e)
     if R["review"]:
-        st.subheader("⚠️ לבדיקה ידנית (ביטחון נמוך)")
+        st.subheader("⚠️ לבדיקה ידנית (ביטחון זיהוי נמוך)")
         for e in R["review"]:
             show(e)
+
+    if R.get("has_context"):
+        st.divider()
+        if R["missing"]:
+            st.subheader("⏳ עדיין חסר מהלקוח")
+            for d in R["missing"]:
+                st.markdown(f"- {d}")
+        else:
+            st.subheader("🎉 כל המסמכים ברשימה התקבלו")
