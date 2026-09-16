@@ -41,7 +41,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-TOOL_BUILD = "sorter-2026-09-16-v10"         # גרסת כלי המיון (נפרד מ-BUILD של המנוע)
+TOOL_BUILD = "sorter-2026-09-16-v11"         # גרסת כלי המיון (נפרד מ-BUILD של המנוע)
 
 CHEAP_MODEL = "claude-haiku-4-5-20251001"   # דגם זול לקריאה
 PRECISE_MODEL = "claude-sonnet-5"           # דגם מדויק לשדרוג ולקיבוץ
@@ -550,6 +550,20 @@ def _targeting_prompt(case_docs: list) -> str:
     )
 
 
+def _parse_groups(raw: str, allowed: set) -> list:
+    """מפענח את תשובת שלב הקיבוץ: קודם פורמט שורות, ואם אין - JSON."""
+    groups = [g for g in parse_kv(raw, allowed) if g.get("indices")]
+    if groups:
+        return groups
+    try:
+        data = _extract_json(raw)
+        if isinstance(data, dict):
+            return [g for g in data.get("groups", []) if g.get("indices")]
+    except Exception:
+        pass
+    return []
+
+
 def group_files(client: Anthropic, model: str, per_file: list, naming_rules: str,
                 case_docs: list = None):
     """מעבר 2 – קיבוץ, שיוך לסאב-אייטם ומתן-שמות. מחזיר (קבוצות, שגיאה_אם_יש).
@@ -587,6 +601,8 @@ def group_files(client: Anthropic, model: str, per_file: list, naming_rules: str
         "אם המסמך ברור – תן confidence גבוה (0.8-1). הורד רק אם באמת לא ברור.\n\n"
         f"{naming_rules}\n\n"
         + _targeting_prompt(case_docs) +
+        "הקבצים:\n" + json.dumps(payload, ensure_ascii=False, indent=1)
+        + "\n\n"
         "פורמט התשובה: לכל קבוצה בלוק שמתחיל בשורת --- ואחריו שדות, כל שדה\n"
         "בשורה נפרדת בפורמט 'מפתח: ערך'. בלי JSON, בלי מרכאות מסביב לערכים,\n"
         "ובלי טקסט נוסף לפני או אחרי. לדוגמה:\n\n"
@@ -608,7 +624,6 @@ def group_files(client: Anthropic, model: str, per_file: list, naming_rules: str
         "note: לא נמצא יעד מתאים\n\n"
         "כל קובץ חייב להופיע בקבוצה אחת בדיוק. סדר את ה-indices לפי page_num "
         "(ואם אין – לפי תאריך). target_index ריק פירושו שאין התאמה.\n\n"
-        "הקבצים:\n" + json.dumps(payload, ensure_ascii=False, indent=1)
     )
     try:
         resp = client.messages.create(
@@ -620,11 +635,39 @@ def group_files(client: Anthropic, model: str, per_file: list, naming_rules: str
         stop = getattr(resp, "stop_reason", None)
         allowed = {"indices", "doc_type", "final_name", "confidence",
                    "target_index", "target_confidence", "note"}
-        groups = [g for g in parse_kv(raw, allowed) if g.get("indices")]
+        groups = _parse_groups(raw, allowed)
+
+        # ניסיון חוזר אחד עם הנחיה מינימלית. כשהתשובה אינה בפורמט המבוקש,
+        # לרוב הסיבה היא הנחיה ארוכה מדי - ובקשה קצרה וממוקדת מצליחה.
         if not groups:
-            groups = _extract_json(raw).get("groups", [])   # נפילה חזרה ל-JSON
+            st.session_state["last_group_raw"] = raw
+            retry = (
+                "התשובה הקודמת לא הייתה בפורמט הנדרש. החזר שוב, "
+                "בפורמט הזה בלבד, בלי שום טקסט אחר:\n\n"
+                "---\n"
+                "indices: 0,1\n"
+                "doc_type: סוג\n"
+                "final_name: שם הקובץ\n"
+                "confidence: 0.9\n"
+                "target_index: 2\n"
+                "target_confidence: 0.9\n"
+                "note: \n\n"
+                "בלוק אחד לכל מסמך לוגי. כל אינדקס מרשימת הקבצים חייב להופיע "
+                "בדיוק פעם אחת.\n\n"
+                "התשובה הקודמת שלך:\n" + raw[:4000]
+            )
+            resp2 = client.messages.create(
+                model=model, max_tokens=8000,
+                messages=[{"role": "user", "content": [{"type": "text", "text": retry}]}],
+            )
+            _track_usage(model, resp2)
+            raw2 = "".join(b.text for b in resp2.content if b.type == "text")
+            st.session_state["last_group_raw"] = raw + "\n\n=== ניסיון חוזר ===\n" + raw2
+            groups = _parse_groups(raw2, allowed)
+            stop = getattr(resp2, "stop_reason", None)
+
         if not groups:
-            raise ValueError("empty groups")
+            raise ValueError("התשובה לא הייתה בפורמט הנדרש")
         # ודא שכל קובץ שויך; מה שנשמט – לקבוצה משלו
         seen = {i for g in groups for i in g.get("indices", [])}
         for i in range(len(per_file)):
@@ -847,6 +890,7 @@ with c2:
 
 if run:
     client = Anthropic(api_key=api_key)
+    st.session_state.pop("last_group_raw", None)
     files = [{"filename": f.name, "bytes": f.getvalue()} for f in uploaded]
 
     # מעבר 1 – קריאה, עם שדרוג בעת ספק
@@ -878,6 +922,12 @@ if run:
     groups, group_err = group_files(client, PRECISE_MODEL, per_file, naming_rules, case_docs)
     if group_err:
         st.error(f"⚠️ {group_err}")
+        dbg = st.session_state.get("last_group_raw")
+        if dbg:
+            with st.expander("🔍 מה המודל באמת החזיר (לאבחון)"):
+                st.code(dbg[:6000])
+            st.caption("העתיקי את הטקסט הזה ושלחי אותו – ממנו אפשר לראות "
+                       "בדיוק למה הפענוח נכשל.")
     prog.empty()
 
     # בניית קבצים ממוזגים
