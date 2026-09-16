@@ -40,13 +40,19 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-TOOL_BUILD = "sorter-2026-09-10-v3"         # גרסת כלי המיון (נפרד מ-BUILD של המנוע)
+TOOL_BUILD = "sorter-2026-09-16-v5"         # גרסת כלי המיון (נפרד מ-BUILD של המנוע)
 
 CHEAP_MODEL = "claude-haiku-4-5-20251001"   # דגם זול לקריאה
 PRECISE_MODEL = "claude-sonnet-5"           # דגם מדויק לשדרוג ולקיבוץ
 
 # שם התיקייה/היעד לקבצים שלא שויכו לשום סאב-אייטם.
 UNMATCHED_LABEL = "מסמכים נוספים"
+
+# דיוק הרינדור. גבוה כששכבת הטקסט שבורה והמודל חייב לקרוא הכל בעיניים;
+# נמוך כשהיא תקינה, כי אז התמונה משמשת רק ללוגו ולפריסה והטקסט מצורף בנפרד.
+DPI_BROKEN_TEXT = 150
+DPI_GOOD_TEXT = 110
+MAX_PAGES = 8
 
 IMAGE_MIME = {
     "jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
@@ -56,7 +62,7 @@ IMAGE_MIME = {
 FIELDS = {"doc_type": "אחר", "source": None, "date_start": None, "date_end": None,
           "period_label": None, "account_last3": None, "property_address": None,
           "person_name": None, "business_name": None, "page_num": None, "page_total": None,
-          "balance_start": None, "balance_end": None,
+          "balance_start": None, "balance_end": None, "read_mode": "",
           "summary": "", "confidence": 0.0}
 
 # balance_start / balance_end נאספים כבר עכשיו לצורך בדיקת רצף עתידית:
@@ -180,36 +186,95 @@ def reading_bytes(name: str, data: bytes, only_edges: bool) -> bytes:
     return out
 
 
-def _file_block(name: str, data: bytes):
+def _text_layer_verdict(doc) -> str:
+    """מאבחן את שכבת הטקסט של ה-PDF. מחזיר "broken" או "ok".
+
+    שלושה מצבי כשל נפוצים במסמכים ישראליים:
+      1. קידוד עברי ישן - הטקסט יוצא כתווים לטיניים משובשים ואפס עברית.
+      2. מסמך סרוק - כמעט אין טקסט בכלל.
+      3. טקסט דליל מדי מכדי להסתמך עליו.
+    בכל אחד מהם חייבים לקרוא את המסמך כתמונה.
+    """
+    sample = "".join(doc[i].get_text() for i in range(min(2, doc.page_count)))
+    if len(sample.strip()) < 50 * min(2, doc.page_count):
+        return "broken"                      # סרוק או ריק
+    heb = sum(1 for c in sample if "\u0590" <= c <= "\u05FF")
+    mojibake = sum(1 for c in sample if "\u00C0" <= c <= "\u00FF")
+    if heb == 0 and mojibake > 20:
+        return "broken"                      # קידוד עברי ישן
+    if heb < len(sample) * 0.05:
+        return "broken"                      # כמעט בלי עברית - חשוד
+    return "ok"
+
+
+def _render(page, dpi: int, cap: int = 1568) -> bytes:
+    """מרנדר עמוד ל-PNG, עם תקרת גודל (מעבר לה התמונה ממילא מוקטנת בצד השני)."""
+    pix = page.get_pixmap(dpi=dpi)
+    if max(pix.width, pix.height) > cap:
+        pix = page.get_pixmap(dpi=int(dpi * cap / max(pix.width, pix.height)))
+    return pix.tobytes("png")
+
+
+def _file_blocks(name: str, data: bytes, only_edges: bool) -> tuple:
+    """בונה את הבלוקים לשליחה. מחזיר (בלוקים, תיאור_מצב_הקריאה).
+
+    PDF נקרא תמיד כתמונות, ולא כמסמך. הסיבה כלכלית ולא רק איכותית: שליחת PDF
+    כמסמך גורמת לשרת לחייב גם על הטקסט וגם על תמונה של כל עמוד. תמונות בלבד
+    עולות פחות, ומונעות את בעיית הקידוד העברי השבור.
+
+    הדיוק נקבע לפי איכות שכבת הטקסט: כשהיא שבורה המודל חייב לקרוא הכל בעיניים,
+    ולכן דיוק גבוה. כשהיא תקינה מצרפים את הטקסט המחולץ כרשת ביטחון, והתמונה
+    נחוצה רק ללוגו ולפריסה - אז אפשר להסתפק בדיוק נמוך וזול יותר.
+    """
     ext = name.rsplit(".", 1)[-1].lower()
-    b64 = base64.standard_b64encode(data).decode("utf-8")
-    if ext == "pdf":
-        return {"type": "document",
-                "source": {"type": "base64", "media_type": "application/pdf", "data": b64}}
-    if ext in IMAGE_MIME:
+
+    def img(b: bytes, mime: str):
         return {"type": "image",
-                "source": {"type": "base64", "media_type": IMAGE_MIME[ext], "data": b64}}
-    return None
+                "source": {"type": "base64", "media_type": mime,
+                           "data": base64.standard_b64encode(b).decode("utf-8")}}
 
+    if ext in IMAGE_MIME:
+        return [img(data, IMAGE_MIME[ext])], "תמונה"
 
-def _case_context_block(case_docs: list) -> str:
-    """טקסט הקשר קצר למעבר 1: מה התיק מחכה לו. ריק אם אין רשימה."""
-    if not case_docs:
-        return ""
-    lines = "\n".join(f"- {d}" for d in case_docs)
-    return (
-        "\nהקשר: התיק שאליו שייך המסמך ממתין למסמכים הבאים:\n" + lines +
-        "\nהשתמש בהקשר כדי לדייק את הזיהוי, אך אל תכריח התאמה: אם המסמך אינו "
-        "אחד מהם - דווח מה שהוא באמת.\n"
-    )
+    if ext != "pdf":
+        return [], "לא נתמך"
+
+    try:
+        doc = fitz.open(stream=data, filetype="pdf")
+        n = doc.page_count
+        idxs = [0, n - 1] if (only_edges and n > 2) else list(range(n))
+        idxs = idxs[:MAX_PAGES]
+
+        verdict = _text_layer_verdict(doc)
+        dpi = DPI_BROKEN_TEXT if verdict == "broken" else DPI_GOOD_TEXT
+        blocks = [img(_render(doc[i], dpi), "image/png") for i in idxs]
+
+        if verdict == "ok":
+            txt = "\n".join(doc[i].get_text() for i in idxs).strip()
+            if txt:
+                blocks.append({
+                    "type": "text",
+                    "text": ("טקסט שחולץ מהקובץ (ייתכן שסדר המילים משובש - "
+                             "התמונות הן המקור המהימן):\n" + txt[:12000])
+                })
+        doc.close()
+        note = "ויזואלי (טקסט שבור)" if verdict == "broken" else "ויזואלי + טקסט"
+        return blocks, note
+    except Exception:
+        # נפילה חזרה בטוחה: אם הרינדור נכשל, נשלח את ה-PDF כמסמך כמו קודם
+        return ([{"type": "document",
+                  "source": {"type": "base64", "media_type": "application/pdf",
+                             "data": base64.standard_b64encode(data).decode("utf-8")}}],
+                "מסמך (נפילה חזרה)")
 
 
 def analyze_one(client: Anthropic, model: str, name: str, data: bytes,
-                case_docs: list = None) -> dict:
+                case_docs: list = None, only_edges: bool = True) -> dict:
     """מעבר 1 – קריאת קובץ בודד. מחזיר תמיד dict עם כל השדות."""
     result = dict(FIELDS)
-    block = _file_block(name, data)
-    if block is None:
+    blocks, read_note = _file_blocks(name, data, only_edges)
+    result["read_mode"] = read_note
+    if not blocks:
         result["summary"] = f"סוג קובץ לא נתמך: {name}"
         return result
     prompt = (
@@ -231,12 +296,20 @@ def analyze_one(client: Anthropic, model: str, name: str, data: bytes,
         '"confidence": מספר בין 0 ל-1}\n'
         "date_start/date_end = טווח התאריכים שבמסמך. אם יום בודד – שים אותו בשניהם.\n"
         "balance_start/balance_end: היתרה בתחילת הדף ובסופו, כפי שמופיעות בדוח. "
-        "הן משמשות לבדיקת רצף בין דפים, אז דייק בהן."
+        "הן משמשות לבדיקת רצף בין דפים, אז דייק בהן.\n"
+        "\nזהירות בזיהוי הבנק (source): קח אותו מהלוגו, מהכותרת או מהכותרת "
+        "התחתונה של הדוח - לא משמות שמופיעים בשורות התנועות. בדוח של בנק אחד "
+        "מופיעות תנועות בבנקים אחרים (למשל 'כספומט לאומי' בדוח של מזרחי), "
+        "והן אינן מעידות על מנפיק הדוח. אם הלוגו לא קריא - השאר source ריק "
+        "והורד confidence, אל תנחש לפי שכיחות מילים.\n"
+        "אם המסמך נראה כתלוש שכר (יש בו 'תלוש שכר לחודש', ברוטו, נטו, ניכויי "
+        "חובה) - doc_type הוא תלוש שכר, גם אם מופיע בו מספר חשבון בנק."
         + _case_context_block(case_docs)
     )
     resp = client.messages.create(
         model=model, max_tokens=700,
-        messages=[{"role": "user", "content": [block, {"type": "text", "text": prompt}]}],
+        messages=[{"role": "user",
+                   "content": blocks + [{"type": "text", "text": prompt}]}],
     )
     raw = "".join(b.text for b in resp.content if b.type == "text")
     try:
@@ -285,11 +358,23 @@ def _targeting_prompt(case_docs: list) -> str:
         "לכל קבוצה החזר target_index – המספר מהרשימה שאליו המסמך שייך, "
         "ו-target_confidence בין 0 ל-1.\n"
         "כללי השיוך:\n"
+        "0. פריט ברשימה יכול להיות שם מסמך מדויק ('עובר ושב 3 חודשים - בנק "
+        "דיסקונט') או דלי-קטגוריה רחב ('מסמכי בנקים', 'מסמכי הכנסות', "
+        "'אישור זכויות'). זהה לבד באיזה סוג מדובר.\n"
+        "   כשהפריט הוא דלי-קטגוריה - שייך אליו כל מסמך שנופל בקטגוריה, גם אם "
+        "שמו המדויק שונה. דוגמאות: נסח טאבו, אישור זכויות, שובר ארנונה וצו רישום "
+        "בית שייכים כולם לדלי של מסמכי זכויות בנכס; תלוש שכר, טופס 106 ואישור "
+        "רו\"ח שייכים לדלי הכנסות; תנועות עו\"ש, אישור ניהול חשבון וריכוז יתרות "
+        "שייכים לדלי מסמכי בנקים. אל תדרוש התאמת שם מילולית בדלי רחב.\n"
+        "   אם קיים גם דלי רחב וגם פריט מדויק שמתאים - בחר במדויק.\n"
         "1. ההתאמה היא לפי מהות, לא לפי מילים. השווה סוג מסמך, מוסד, ובעל המסמך.\n"
         "2. שם הבנק ברשימה הוא השם הרשמי המלא (למשל 'בנק דיסקונט לישראל בע\"מ') "
         "ובמסמך הוא לרוב מקוצר ('דיסקונט'). זו התאמה תקפה.\n"
         "3. חוק ברזל: אם ברשימה יש כמה פריטים מאותו סוג שנבדלים בשם האדם או בבנק – "
         "חייבים להתאים גם את השם וגם את הבנק. אל תבחר על סמך הסוג בלבד.\n"
+        "   זה חל גם על דליים: אם יש 'מסמכי הכנסות' וגם 'מסמכי הכנסות של האישה', "
+        "הכרעה לפי person_name היא חובה. אם השם במסמך לא זוהה - "
+        "החזר null ואל תנחש מי מבני הזוג.\n"
         "4. אם אין התאמה ברורה, או שיש שתי אפשרויות ואינך יכול להכריע – "
         "החזר target_index: null. זו תשובה נכונה ועדיפה על ניחוש; "
         "הקובץ יטופל ידנית. אל תכריח שיוך.\n"
@@ -433,6 +518,8 @@ with st.sidebar:
     economical = mode.startswith("חסכוני")
 
     only_edges = st.checkbox("ב-PDF לקרוא רק עמוד ראשון + אחרון (חוסך)", value=True)
+    st.caption("קריאת PDF ויזואלית ואוטומטית: הכלי מאבחן לבד את שכבת הטקסט "
+               "ובוחר דיוק בהתאם. אין מה להגדיר.")
     threshold = st.slider("סף ביטחון (מתחתיו: שדרוג לסונט, ואם עדיין נמוך – 'לבדיקה')",
                           0.0, 1.0, 0.7, 0.05)
     match_threshold = st.slider("סף שיוך לסאב-אייטם (מתחתיו: 'מסמכים נוספים')",
@@ -478,10 +565,10 @@ def analyze_cached(client, model, name, data, only_edges, case_docs=None):
     """
     rb = reading_bytes(name, data, only_edges)
     ctx = hashlib.sha256("|".join(case_docs or []).encode("utf-8")).hexdigest()[:12]
-    key = hashlib.sha256(rb).hexdigest() + "|" + model + "|" + ctx
+    key = hashlib.sha256(rb).hexdigest() + "|" + model + "|" + ctx + "|" + TOOL_BUILD
     if key in st.session_state["cache"]:
         return st.session_state["cache"][key], True
-    a = analyze_one(client, model, name, rb, case_docs)
+    a = analyze_one(client, model, name, rb, case_docs, only_edges)
     st.session_state["cache"][key] = a
     return a, False
 
@@ -518,7 +605,10 @@ if run:
             a, hit = analyze_cached(client, CHEAP_MODEL, f["filename"], f["bytes"],
                                     only_edges, case_docs)
             used = "זול"
-            if float(a.get("confidence") or 0) < threshold:
+            # שדרוג גם כשלא חולץ שם אדם: זה סימן מובהק לקריאה כושלת, גם אם
+            # המודל דיווח ביטחון גבוה. בלי שם אין שיוך אפשרי בתיק זוגי.
+            if (float(a.get("confidence") or 0) < threshold
+                    or not (a.get("person_name") or "").strip()):
                 a, hit2 = analyze_cached(client, PRECISE_MODEL, f["filename"], f["bytes"],
                                          only_edges, case_docs)
                 used, hit = "שודרג לסונט", hit and hit2
@@ -588,6 +678,7 @@ if run:
                    "דף": (f'{m["a"].get("page_num")}/{m["a"].get("page_total")}'
                           if m["a"].get("page_num") else ""),
                    "ביטחון": round(float(m["a"].get("confidence") or 0), 2),
+                   "אופן קריאה": m["a"].get("read_mode", ""),
                    "נקרא ב": m["used"]} for m in per_file],
         "n_files": len(files), "from_cache": from_cache,
         "upgraded": sum(1 for m in per_file if m["used"] == "שודרג לסונט"),
