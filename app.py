@@ -41,7 +41,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-TOOL_BUILD = "sorter-2026-09-16-v8"         # גרסת כלי המיון (נפרד מ-BUILD של המנוע)
+TOOL_BUILD = "sorter-2026-09-16-v10"         # גרסת כלי המיון (נפרד מ-BUILD של המנוע)
 
 CHEAP_MODEL = "claude-haiku-4-5-20251001"   # דגם זול לקריאה
 PRECISE_MODEL = "claude-sonnet-5"           # דגם מדויק לשדרוג ולקיבוץ
@@ -60,16 +60,6 @@ DEFAULT_PRICES = {
     CHEAP_MODEL: (1.00, 5.00),     # Haiku 4.5
     PRECISE_MODEL: (2.00, 10.00),  # Sonnet 5
 }
-
-# הנחיה שחוזרת בשני המעברים: שמות ישראליים רבים מכילים גרש כפול רגיל
-# (בע\u05F4מ, עו\u05F4ש, רו\u05F4ח). כשהמודל מעתיק אותם כמות שהם לתוך ערך JSON,
-# הגרש סוגר את המחרוזת והפענוח נשבר באמצע המילה.
-_JSON_QUOTE_GUARD = (
-    '\n\nחשוב לפורמט: בתוך ערכי המחרוזות אל תשתמש בגרש כפול רגיל. '
-    'שם שמכיל בע\u05F4מ, עו\u05F4ש או רו\u05F4ח - כתוב עם גרשיים עבריים '
-    '(\u05F4) ולא עם תו הגרש הכפול הרגיל, שהוא תו מבנה ב-JSON ושובר את הפענוח.'
-)
-
 
 IMAGE_MIME = {
     "jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
@@ -162,23 +152,120 @@ DEFAULT_NAMING_RULES = """בנה שם קובץ (בלי סיומת) לפי סוג
 # --------------------------------------------------------------- פונקציות עזר
 
 
+# מפתחות שערכם מספרי, לצורך המרה אוטומטית אחרי הקריאה
+_NUM_KEYS = {"confidence", "target_confidence", "page_num", "page_total",
+             "balance_start", "balance_end", "target_index"}
+
+
+def _coerce(key: str, val: str):
+    """ממיר ערך טקסטואלי לטיפוס הנכון. ריק / 'null' / '-' הופכים ל-None."""
+    v = val.strip()
+    if v == "" or v.lower() in ("null", "none", "-", "אין", "לא ידוע"):
+        return None
+    if key == "indices":
+        out = []
+        for part in v.replace("[", " ").replace("]", " ").replace(",", " ").split():
+            try:
+                out.append(int(part))
+            except ValueError:
+                pass
+        return out
+    if key in _NUM_KEYS:
+        cleaned = v.replace(",", "").replace("%", "").strip()
+        try:
+            f = float(cleaned)
+            return int(f) if f == int(f) and key not in (
+                "confidence", "target_confidence", "balance_start", "balance_end") else f
+        except ValueError:
+            return None
+    return v
+
+
+def parse_kv(text: str, allowed: set) -> list:
+    """קורא תשובה בפורמט שורות 'מפתח: ערך' ומחזיר רשימת רשומות.
+
+    למה לא JSON: שמות ישראליים מכילים גרש כפול (בע"מ, עו"ש, נספח "יב"), והוא
+    תו מבנה ב-JSON. כל טלאי שתיקן מקרה אחד נשבר על מקרה אחר. כאן הגרש הוא תו
+    רגיל לחלוטין - מה שמפריד בין שדות הוא סוף שורה, ובין מפתח לערך הנקודתיים
+    הראשונות. שניהם אינם מופיעים בתוך שמות מסמכים, ולכן אין מה לשבור.
+
+    שורה שמתחילה ב--- פותחת רשומה חדשה. שורה שאינה 'מפתח מוכר: ערך' מתעלמים
+    ממנה, כך שפתיח או הסבר מהמודל לא מפילים את הקריאה.
+    """
+    records, cur = [], {}
+    for line in text.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        if s.startswith("---"):
+            if cur:
+                records.append(cur)
+            cur = {}
+            continue
+        if ":" not in s:
+            continue
+        key, _, val = s.partition(":")
+        key = key.strip().strip("*-# ").lower()
+        if key not in allowed:
+            continue
+        if key in cur and cur[key] not in (None, ""):
+            records.append(cur)       # אותו מפתח שוב = רשומה חדשה בלי מפריד
+            cur = {}
+        cur[key] = _coerce(key, val)
+    if cur:
+        records.append(cur)
+    return records
+
+
 def _extract_json(text: str):
-    """מחלץ את אובייקט ה-JSON מהתשובה, גם אם יש טקסט מסביב."""
+    """מחלץ את אובייקט ה-JSON מהתשובה, גם אם יש טקסט מסביב או גרשיים שבורים."""
     t = _clean_json(text)
-    try:
-        return json.loads(t)
-    except Exception:
-        pass
     i, j = t.find("{"), t.rfind("}")
-    if i != -1 and j > i:
-        return json.loads(t[i:j + 1])
+    core = t[i:j + 1] if (i != -1 and j > i) else t
+    for candidate in (t, core, _repair_json_quotes(t), _repair_json_quotes(core)):
+        try:
+            return json.loads(candidate)
+        except Exception:
+            continue
     raise ValueError("no json")
 
 
-# גרש כפול רגיל שנמצא בין שתי אותיות עבריות הוא חלק מהמילה (בע"מ, עו"ש,
-# רו"ח, ש"ח) ולא סוגר מחרוזת JSON. בלי התיקון הזה כל מסמך שמכיל שם חברה עם
-# בע"מ מפיל את הפענוח. מחליפים אותו בגרשיים עבריים, שאינם תו JSON.
-_HEB_QUOTE = re.compile(r'(?<=[\u0590-\u05FF])"(?=[\u0590-\u05FF])')
+def _repair_json_quotes(text: str) -> str:
+    """מתקן גרשיים לא-מוברחים בתוך ערכי מחרוזת ב-JSON.
+
+    למה צריך: שמות ישראליים מכילים גרש כפול רגיל - בע"מ, עו"ש, נספח "יב".
+    כשהמודל מעתיק אותם לתוך ערך JSON, הגרש נקרא כסוגר מחרוזת והפענוח נשבר.
+
+    איך: סורקים תו-תו. כשאנחנו בתוך מחרוזת ונתקלים בגרש, מציצים קדימה: אם אחריו
+    בא תו מבנה (פסיק, נקודתיים, סוגר) או סוף הטקסט - זה גרש סוגר אמיתי. אחרת
+    הוא חלק מהתוכן, ומבריחים אותו. גישה זו כללית ואינה תלויה בשפה.
+    """
+    out, in_str, esc, n = [], False, False, len(text)
+    for i, ch in enumerate(text):
+        if esc:
+            out.append(ch)
+            esc = False
+            continue
+        if ch == "\\":
+            out.append(ch)
+            esc = True
+            continue
+        if ch == '"':
+            if not in_str:
+                in_str = True
+                out.append(ch)
+                continue
+            j = i + 1
+            while j < n and text[j] in " \t\r\n":
+                j += 1
+            if j >= n or text[j] in ",:}]":
+                in_str = False
+                out.append(ch)
+            else:
+                out.append('\\"')      # גרש תוכן - מבריחים
+            continue
+        out.append(ch)
+    return "".join(out)
 
 
 def _clean_json(text: str) -> str:
@@ -187,8 +274,7 @@ def _clean_json(text: str) -> str:
         text = text.split("```", 2)[1]
         if text.lstrip().lower().startswith("json"):
             text = text.lstrip()[4:]
-    text = text.strip().strip("`").strip()
-    return _HEB_QUOTE.sub("\u05F4", text)
+    return text.strip().strip("`").strip()
 
 
 def reading_bytes(name: str, data: bytes, only_edges: bool) -> bytes:
@@ -346,36 +432,38 @@ def analyze_one(client: Anthropic, model: str, name: str, data: bytes,
         result["summary"] = f"סוג קובץ לא נתמך: {name}"
         return result
     prompt = (
-        "זהו מסמך שלקוח שלח למשרד ייעוץ פיננסי/ראיית חשבון. קרא אותו והחזר JSON בלבד "
-        "(בלי טקסט נוסף) בשדות:\n"
-        '{"doc_type": "תיאור קצר בעברית של סוג המסמך (למשל: תנועות עו״ש, נסח טאבו, תלוש שכר)", '
-        '"source": "שם בנק/מוסד/מעסיק או null", '
-        '"date_start": "YYYY-MM-DD או null", "date_end": "YYYY-MM-DD או null", '
-        '"period_label": "חודשים/שנה, למשל 04-06/2026 או 2025, או null", '
-        '"account_last3": "3 ספרות אחרונות של מספר החשבון או null", '
-        '"property_address": "כתובת נכס אם רלוונטי או null", '
-        '"person_name": "השם הפרטי של האדם/הלקוח שהמסמך שייך לו, או null", '
-        '"business_name": "שם עסק/חברה אם רלוונטי או null", '
-        '"page_num": מספר הדף של העמוד הראשון שקיבלת, לפי המספור המודפס במסמך '
-        '(למשל "דף 2 מתוך 5" / "עמוד 2 מתוך 4" / "1/2"), אחרת null, '
-        '"page_total": סך הדפים באותו מספור, אחרת null, '
-        '"balance_start": יתרת הפתיחה בדף (מספר) אם זה דף תנועות עו״ש, אחרת null, '
-        '"balance_end": יתרת הסגירה בדף (מספר) אם זה דף תנועות עו״ש, אחרת null, '
-        '"summary": "משפט קצר בעברית", '
-        '"confidence": מספר בין 0 ל-1}\n'
-        "date_start/date_end = טווח התאריכים שבמסמך. אם יום בודד – שים אותו בשניהם.\n"
-        "balance_start/balance_end: היתרה בתחילת הדף ובסופו, כפי שמופיעות בדוח. "
-        "הן משמשות לבדיקת רצף בין דפים, אז דייק בהן.\n"
-        "\nזהירות בזיהוי הבנק (source): קח אותו מהלוגו, מהכותרת או מהכותרת "
-        "התחתונה של הדוח - לא משמות שמופיעים בשורות התנועות. בדוח של בנק אחד "
-        "מופיעות תנועות בבנקים אחרים (למשל 'כספומט לאומי' בדוח של מזרחי), "
-        "והן אינן מעידות על מנפיק הדוח. אם הלוגו לא קריא - השאר source ריק "
-        "והורד confidence, אל תנחש לפי שכיחות מילים.\n"
-        "אם המסמך נראה כתלוש שכר (יש בו 'תלוש שכר לחודש', ברוטו, נטו, ניכויי "
-        "חובה) - doc_type הוא תלוש שכר, גם אם מופיע בו מספר חשבון בנק.\n"
-        "\nייתכן שקיבלת כמה תמונות של אותו קובץ. page_num מתייחס תמיד לעמוד "
-        "הראשון שקיבלת, לא לאחרון."
-        + _JSON_QUOTE_GUARD
+        "זהו מסמך שלקוח שלח למשרד ייעוץ פיננסי. קרא אותו והחזר את השדות הבאים,\n"
+        "כל שדה בשורה נפרדת, בפורמט 'מפתח: ערך'. בלי JSON, בלי סוגריים, בלי\n"
+        "מרכאות מסביב לערכים, ובלי טקסט נוסף לפני או אחרי.\n"
+        "שדה שאין לו ערך - השאר ריק אחרי הנקודתיים.\n\n"
+        "doc_type: תיאור קצר בעברית של סוג המסמך (תנועות עו״ש / נסח טאבו / תלוש שכר)\n"
+        "source: שם בנק, מוסד או מעסיק\n"
+        "date_start: YYYY-MM-DD\n"
+        "date_end: YYYY-MM-DD\n"
+        "period_label: חודשים או שנה, למשל 04-06/2026\n"
+        "account_last3: שלוש ספרות אחרונות של מספר החשבון\n"
+        "property_address: כתובת נכס אם רלוונטי\n"
+        "person_name: שם האדם שהמסמך שייך לו - העובד בתלוש, בעל החשבון בדוח\n"
+        "business_name: שם עסק או חברה\n"
+        "page_num: מספר הדף לפי המספור המודפס\n"
+        "page_total: סך הדפים באותו מספור\n"
+        "balance_start: יתרת הפתיחה בדף, אם זה דף תנועות\n"
+        "balance_end: יתרת הסגירה בדף, אם זה דף תנועות\n"
+        "summary: משפט קצר בעברית\n"
+        "confidence: מספר בין 0 ל-1\n\n"
+        "הנחיות תוכן:\n"
+        "date_start/date_end הם טווח התאריכים שבמסמך. יום בודד - שים בשניהם.\n"
+        "balance_start/balance_end משמשים לבדיקת רצף בין דפים, אז דייק בהם.\n"
+        "person_name הוא שם אדם בלבד. לא כתובת מגורים, לא שם רחוב, ולא שם "
+        "המעסיק. אם יש ספק - השאר ריק.\n"
+        "את שם הבנק (source) קח מהלוגו או מהכותרת, לא משורות התנועות: בדוח של "
+        "בנק אחד מופיעות תנועות בבנקים אחרים (למשל כספומט לאומי בדוח של מזרחי), "
+        "והן אינן מעידות על מנפיק הדוח. אם הלוגו לא קריא - השאר ריק והורד "
+        "confidence, אל תנחש לפי שכיחות מילים.\n"
+        "מסמך שיש בו תלוש שכר לחודש, ברוטו, נטו וניכויי חובה - הוא תלוש שכר, "
+        "גם אם מופיע בו מספר חשבון בנק.\n"
+        "ייתכן שקיבלת כמה תמונות של אותו קובץ. page_num מתייחס לעמוד הראשון "
+        "שקיבלת, לא לאחרון."
         + _case_context_block(case_docs)
     )
     resp = client.messages.create(
@@ -386,9 +474,12 @@ def analyze_one(client: Anthropic, model: str, name: str, data: bytes,
     _track_usage(model, resp)
     raw = "".join(b.text for b in resp.content if b.type == "text")
     try:
-        parsed = json.loads(_clean_json(raw))
+        recs = parse_kv(raw, set(FIELDS))
+        if not recs:
+            recs = [_extract_json(raw)]          # נפילה חזרה אם חזר JSON בכל זאת
+        parsed = recs[0]
         for k in FIELDS:
-            if k in parsed and parsed[k] is not None:
+            if parsed.get(k) is not None:
                 result[k] = parsed[k]
     except Exception as e:
         # חושפים את הסיבה במקום להבליע: בלי זה הקובץ יוצא "אחר / 0.0" בלי הסבר,
@@ -496,11 +587,27 @@ def group_files(client: Anthropic, model: str, per_file: list, naming_rules: str
         "אם המסמך ברור – תן confidence גבוה (0.8-1). הורד רק אם באמת לא ברור.\n\n"
         f"{naming_rules}\n\n"
         + _targeting_prompt(case_docs) +
-        "החזר JSON בלבד, בלי טקסט מסביב:\n"
-        '{"groups": [{"indices": [0,1], "doc_type": "...", "final_name": "שם לפי הכללים", '
-        '"confidence": 0.9, "target_index": 2, "target_confidence": 0.9, "note": ""}]}\n'
-        "כל קובץ חייב להופיע בקבוצה אחת בדיוק. סדר את ה-indices לפי page_num (ואם אין – לפי תאריך).\n"
-        + _JSON_QUOTE_GUARD + "\n\n"
+        "פורמט התשובה: לכל קבוצה בלוק שמתחיל בשורת --- ואחריו שדות, כל שדה\n"
+        "בשורה נפרדת בפורמט 'מפתח: ערך'. בלי JSON, בלי מרכאות מסביב לערכים,\n"
+        "ובלי טקסט נוסף לפני או אחרי. לדוגמה:\n\n"
+        "---\n"
+        "indices: 0,1,2\n"
+        "doc_type: תלושי שכר\n"
+        "final_name: תלושים 05-07 טלי\n"
+        "confidence: 0.95\n"
+        "target_index: 1\n"
+        "target_confidence: 0.9\n"
+        "note: \n"
+        "---\n"
+        "indices: 3\n"
+        "doc_type: תנועות עו״ש\n"
+        "final_name: תנועות עוש 04.06-05.08 מזרחי אנדרגה\n"
+        "confidence: 0.9\n"
+        "target_index: \n"
+        "target_confidence: 0\n"
+        "note: לא נמצא יעד מתאים\n\n"
+        "כל קובץ חייב להופיע בקבוצה אחת בדיוק. סדר את ה-indices לפי page_num "
+        "(ואם אין – לפי תאריך). target_index ריק פירושו שאין התאמה.\n\n"
         "הקבצים:\n" + json.dumps(payload, ensure_ascii=False, indent=1)
     )
     try:
@@ -511,7 +618,11 @@ def group_files(client: Anthropic, model: str, per_file: list, naming_rules: str
         _track_usage(model, resp)
         raw = "".join(b.text for b in resp.content if b.type == "text")
         stop = getattr(resp, "stop_reason", None)
-        groups = _extract_json(raw).get("groups", [])
+        allowed = {"indices", "doc_type", "final_name", "confidence",
+                   "target_index", "target_confidence", "note"}
+        groups = [g for g in parse_kv(raw, allowed) if g.get("indices")]
+        if not groups:
+            groups = _extract_json(raw).get("groups", [])   # נפילה חזרה ל-JSON
         if not groups:
             raise ValueError("empty groups")
         # ודא שכל קובץ שויך; מה שנשמט – לקבוצה משלו
@@ -580,11 +691,17 @@ def html_table(rows: list) -> str:
     )
 
 
-def render_cost_panel(prices: dict) -> None:
-    """מצייר את מד העלות. חייב להיקרא באזור התוצאות ולא בסרגל הצד:
-    סרגל הצד מצויר לפני שההרצה מתחילה, ולכן המונה שם עדיין ריק."""
+def render_cost_panel(prices: dict, slot=None) -> None:
+    """מצייר את מד העלות בסרגל הצד.
+
+    סרגל הצד מצויר לפני שההרצה מתחילה, ולכן אי אפשר פשוט לכתוב אותו שם - הוא
+    יראה תמיד את ההרצה הקודמת. הפתרון: שומרים מקום ריק בסרגל בזמן הציור,
+    וממלאים אותו אחרי שההרצה הסתיימה.
+    """
+    box = slot.container() if slot is not None else st
     usage = st.session_state.get("usage", {})
     if not usage:
+        box.caption("עוד לא בוצעו קריאות בהפעלה הזו.")
         return
     rows, total = [], 0.0
     for mdl, d in usage.items():
@@ -595,13 +712,13 @@ def render_cost_panel(prices: dict) -> None:
                      "קריאות": d["calls"],
                      "טוקני קלט": f'{d["in"]:,}', "טוקני פלט": f'{d["out"]:,}',
                      "עלות": f"${cost:.4f}"})
-    with st.expander(f"💰 עלות מצטברת בהפעלה הזו: ${total:.3f}", expanded=True):
-        st.markdown(html_table(rows), unsafe_allow_html=True)
-        st.caption("המספרים מדווחים על ידי השרת, לא מאומדן. קבצים שנשלפו "
-                   "מהזיכרון אינם נספרים - לא שולם עליהם.")
-        if st.button("אפס מונה עלות"):
-            st.session_state["usage"] = {}
-            st.rerun()
+    box.metric("עלות בהפעלה הזו", f"${total:.4f}")
+    box.markdown(html_table(rows), unsafe_allow_html=True)
+    box.caption("המספרים מדווחים על ידי השרת ולא מאומדן. קבצים שנשלפו "
+                "מהזיכרון אינם נספרים - לא שולם עליהם.")
+    if box.button("אפס מונה עלות"):
+        st.session_state["usage"] = {}
+        st.rerun()
 
 
 def safe_filename(name: str) -> str:
@@ -672,6 +789,10 @@ with st.sidebar:
                                      step=0.25, format="%.2f")
     prices = {CHEAP_MODEL: (p_cheap_in, p_cheap_out),
               PRECISE_MODEL: (p_prec_in, p_prec_out)}
+
+    st.divider()
+    st.subheader("עלות")
+    cost_slot = st.empty()
 
     st.caption(f"גרסת כלי: {TOOL_BUILD}")
 
@@ -818,12 +939,14 @@ if run:
         "economical": economical,
     }
 
+# מילוי מד העלות בסרגל – חייב לקרות כאן, אחרי שההרצה הסתיימה
+render_cost_panel(prices, cost_slot)
+
 # --------------------------------------------------- הצגת תוצאות (נשמרות גם אחרי הורדה)
 R = st.session_state.get("results")
 if R:
     n_docs = len(R["ok"]) + len(R["review"]) + len(R.get("extra", []))
     st.success(f"עובדו {R['n_files']} קבצים → {n_docs} מסמכים.")
-    render_cost_panel(prices)
     if R["from_cache"]:
         st.caption(f"({R['from_cache']} קבצים נלקחו מהזיכרון – לא שולם עליהם שוב)")
     st.download_button("⬇️ הורד הכל (ZIP)", R["zip"], file_name="מסמכים_ממוינים.zip",
