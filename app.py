@@ -41,7 +41,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-TOOL_BUILD = "sorter-2026-09-16-v13"         # גרסת כלי המיון (נפרד מ-BUILD של המנוע)
+TOOL_BUILD = "sorter-2026-09-16-v15"         # גרסת כלי המיון (נפרד מ-BUILD של המנוע)
 
 CHEAP_MODEL = "claude-haiku-4-5-20251001"   # דגם זול לקריאה
 PRECISE_MODEL = "claude-sonnet-5"           # דגם מדויק לשדרוג ולקיבוץ
@@ -519,7 +519,7 @@ def analyze_one(client: Anthropic, model: str, name: str, data: bytes,
                    "content": blocks + [{"type": "text", "text": prompt}]}],
     )
     _track_usage(model, resp)
-    raw = "".join(b.text for b in resp.content if b.type == "text")
+    raw = _text_of(resp)
     try:
         recs = parse_kv(raw, set(FIELDS))
         if not recs:
@@ -595,6 +595,21 @@ def _targeting_prompt(case_docs: list) -> str:
         "5. target_confidence נפרד מ-confidence: אפשר לזהות מסמך בוודאות מלאה "
         "ועדיין לא לדעת לאיזה פריט הוא שייך.\n\n"
     )
+
+
+def _text_of(resp) -> str:
+    """מחלץ את הטקסט מהתשובה. כשאין בלוק טקסט כלל, מחזיר דיווח אבחוני
+    במקום מחרוזת ריקה - תשובה ריקה בלי הסבר היא הדבר הכי קשה לאבחן."""
+    text = "".join(getattr(b, "text", "") for b in resp.content
+                   if getattr(b, "type", "") == "text")
+    if text.strip():
+        return text
+    kinds = [getattr(b, "type", "?") for b in resp.content] or ["(אין בלוקים)"]
+    stop = getattr(resp, "stop_reason", "?")
+    u = getattr(resp, "usage", None)
+    out = getattr(u, "output_tokens", "?") if u else "?"
+    return (f"[אבחון] לא הוחזר טקסט. סוגי בלוקים: {kinds}. "
+            f"סיבת עצירה: {stop}. טוקני פלט: {out}.")
 
 
 def _parse_groups(raw: str, allowed: set) -> list:
@@ -674,20 +689,20 @@ def group_files(client: Anthropic, model: str, per_file: list, naming_rules: str
     )
     try:
         resp = client.messages.create(
-            model=model, max_tokens=8000,
+            model=model, max_tokens=16000,
             messages=[{"role": "user", "content": [{"type": "text", "text": prompt}]}],
         )
         _track_usage(model, resp)
-        raw = "".join(b.text for b in resp.content if b.type == "text")
+        raw = _text_of(resp)
         stop = getattr(resp, "stop_reason", None)
         allowed = {"indices", "doc_type", "final_name", "confidence",
                    "target_index", "target_confidence", "note"}
+        st.session_state["last_group_raw"] = raw
         groups = _parse_groups(raw, allowed)
 
         # ניסיון חוזר אחד עם הנחיה מינימלית. כשהתשובה אינה בפורמט המבוקש,
         # לרוב הסיבה היא הנחיה ארוכה מדי - ובקשה קצרה וממוקדת מצליחה.
         if not groups:
-            st.session_state["last_group_raw"] = raw
             retry = (
                 "התשובה הקודמת לא הייתה בפורמט הנדרש. החזר שוב, "
                 "בפורמט הזה בלבד, בלי שום טקסט אחר:\n\n"
@@ -700,21 +715,23 @@ def group_files(client: Anthropic, model: str, per_file: list, naming_rules: str
                 "target_confidence: 0.9\n"
                 "note: \n\n"
                 "בלוק אחד לכל מסמך לוגי. כל אינדקס מרשימת הקבצים חייב להופיע "
-                "בדיוק פעם אחת.\n\n"
-                "התשובה הקודמת שלך:\n" + raw[:4000]
+                "בדיוק פעם אחת. אל תוסיף שום הסבר.\n\n"
+                + _targeting_prompt(case_docs) +
+                "הקבצים:\n" + json.dumps(payload, ensure_ascii=False, indent=1)
             )
             resp2 = client.messages.create(
-                model=model, max_tokens=8000,
+                model=model, max_tokens=16000,
                 messages=[{"role": "user", "content": [{"type": "text", "text": retry}]}],
             )
             _track_usage(model, resp2)
-            raw2 = "".join(b.text for b in resp2.content if b.type == "text")
+            raw2 = _text_of(resp2)
             st.session_state["last_group_raw"] = raw + "\n\n=== ניסיון חוזר ===\n" + raw2
             groups = _parse_groups(raw2, allowed)
             stop = getattr(resp2, "stop_reason", None)
 
         if not groups:
-            raise ValueError("התשובה לא הייתה בפורמט הנדרש")
+            why = " (התשובה נחתכה באמצע - מגבלת אורך)" if stop == "max_tokens" else ""
+            raise ValueError("התשובה לא הייתה בפורמט הנדרש" + why)
         # ודא שכל קובץ שויך; מה שנשמט – לקבוצה משלו
         seen = {i for g in groups for i in g.get("indices", [])}
         for i in range(len(per_file)):
@@ -724,14 +741,30 @@ def group_files(client: Anthropic, model: str, per_file: list, naming_rules: str
                                "confidence": 0.0, "note": "לא שויך לקבוצה"})
         for g in groups:
             _attach_target(g, case_docs)
-        err = "התשובה נחתכה באמצע – ייתכן שהקיבוץ חלקי." if stop == "max_tokens" else None
+        err = None
+        if stop == "max_tokens":
+            err = ("התשובה נחתכה באמצע כי הגיעה למגבלת האורך – ייתכן שהקיבוץ "
+                   "חלקי. אם זה חוזר, כדאי לצמצם את כללי מתן-השמות.")
         return groups, err
     except Exception as e:
-        fallback = [{"indices": [i], "doc_type": f["a"].get("doc_type", "אחר"),
-                     "final_name": f["filename"].rsplit(".", 1)[0],
-                     "confidence": 0.0, "target": None, "target_conf": 0.0,
-                     "note": "לא ניתן לקבץ אוטומטית"}
-                    for i, f in enumerate(per_file)]
+        # נפילה חזרה: קבוצה לכל קובץ, אבל עם שם שנבנה מנתוני מעבר 1 ולא משם
+        # הקובץ המקורי (שהוא לרוב ג'יבריש מהוואטסאפ). כך גם כשהקיבוץ נכשל,
+        # התוצאה עדיין שמישה ואפשר להעלות ידנית.
+        fallback = []
+        for i, f in enumerate(per_file):
+            a = f["a"]
+            parts = [a.get("doc_type") or "מסמך"]
+            if a.get("period_label"):
+                parts.append(str(a["period_label"]))
+            if a.get("source"):
+                parts.append(str(a["source"]))
+            if a.get("person_name"):
+                parts.append(str(a["person_name"]))
+            fallback.append({"indices": [i], "doc_type": a.get("doc_type", "אחר"),
+                             "final_name": " ".join(parts),
+                             "confidence": float(a.get("confidence") or 0),
+                             "target": None, "target_conf": 0.0,
+                             "note": "הקיבוץ נכשל – קובץ בודד, בלי שיוך"})
         return fallback, f"שלב הקיבוץ נכשל: {type(e).__name__}: {e}"
 
 
@@ -971,7 +1004,7 @@ if run:
         st.error(f"⚠️ {group_err}")
         dbg = st.session_state.get("last_group_raw")
         if dbg:
-            with st.expander("🔍 מה המודל באמת החזיר (לאבחון)"):
+            with st.expander("🔍 מה המודל באמת החזיר (לאבחון)", expanded=True):
                 st.code(dbg[:6000])
             st.caption("העתיקי את הטקסט הזה ושלחי אותו – ממנו אפשר לראות "
                        "בדיוק למה הפענוח נכשל.")
