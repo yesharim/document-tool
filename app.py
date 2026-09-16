@@ -41,7 +41,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-TOOL_BUILD = "sorter-2026-09-16-v11"         # גרסת כלי המיון (נפרד מ-BUILD של המנוע)
+TOOL_BUILD = "sorter-2026-09-16-v12"         # גרסת כלי המיון (נפרד מ-BUILD של המנוע)
 
 CHEAP_MODEL = "claude-haiku-4-5-20251001"   # דגם זול לקריאה
 PRECISE_MODEL = "claude-sonnet-5"           # דגם מדויק לשדרוג ולקיבוץ
@@ -170,10 +170,20 @@ def _coerce(key: str, val: str):
             except ValueError:
                 pass
         return out
+    if key in ("confidence", "target_confidence"):
+        words = {"גבוה מאוד": 0.95, "גבוה": 0.9, "בינוני": 0.6,
+                 "נמוך": 0.3, "נמוך מאוד": 0.1, "high": 0.9, "medium": 0.6,
+                 "low": 0.3}
+        if v in words:
+            return words[v]
     if key in _NUM_KEYS:
-        cleaned = v.replace(",", "").replace("%", "").strip()
+        cleaned = v.replace(",", "").strip()
+        pct = cleaned.endswith("%")
+        cleaned = cleaned.rstrip("%").strip()
         try:
             f = float(cleaned)
+            if pct:
+                f = f / 100.0
             return int(f) if f == int(f) and key not in (
                 "confidence", "target_confidence", "balance_start", "balance_end") else f
         except ValueError:
@@ -419,6 +429,10 @@ def _case_context_block(case_docs: list) -> str:
         "\nהקשר: התיק שאליו שייך המסמך ממתין למסמכים הבאים:\n" + lines +
         "\nהשתמש בהקשר כדי לדייק את הזיהוי, אך אל תכריח התאמה: אם המסמך אינו "
         "אחד מהם - דווח מה שהוא באמת.\n"
+        "אם מופיעים ברשימה שמות של אנשים, אלה בעלי התיק. person_name צריך "
+        "להיות אחד מהם. אם השם הבולט במסמך אינו אחד מהם, כמעט תמיד מדובר "
+        "בשם של חותם, נציג או גורם אחר ולא בבעל המסמך - חפש שוב את שם בעל "
+        "המסמך עצמו. רק אם באמת אין התאמה, השאר ריק.\n"
     )
 
 
@@ -462,6 +476,11 @@ def analyze_one(client: Anthropic, model: str, name: str, data: bytes,
         "confidence, אל תנחש לפי שכיחות מילים.\n"
         "מסמך שיש בו תלוש שכר לחודש, ברוטו, נטו וניכויי חובה - הוא תלוש שכר, "
         "גם אם מופיע בו מספר חשבון בנק.\n"
+        "בתלוש שכר, שם העובד יושב בראש המסמך, ליד מספר העובד ומספר הזהות, "
+        "ולצדו כתובת המגורים. תלושים ממעסיקים שונים בנויים אחרת זה מזה, אבל "
+        "בכולם זה המקום. שמות שמופיעים בחתימה, בברכה, בכותרת תחתונה, בפרטי "
+        "קשר של משאבי אנוש או של חשב - אינם העובד. בתלושים של גופים ציבוריים "
+        "מופיעה לעתים ברכה חתומה בשם בכיר; התעלם ממנה.\n"
         "ייתכן שקיבלת כמה תמונות של אותו קובץ. page_num מתייחס לעמוד הראשון "
         "שקיבלת, לא לאחרון."
         + _case_context_block(case_docs)
