@@ -41,7 +41,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-TOOL_BUILD = "sorter-2026-09-16-v22"         # גרסת כלי המיון (נפרד מ-BUILD של המנוע)
+TOOL_BUILD = "sorter-2026-09-16-v23"         # גרסת כלי המיון (נפרד מ-BUILD של המנוע)
 
 CHEAP_MODEL = "claude-haiku-4-5-20251001"   # דגם זול לקריאה
 PRECISE_MODEL = "claude-sonnet-5"           # דגם מדויק לשדרוג ולקיבוץ
@@ -584,6 +584,10 @@ def _targeting_prompt(case_docs: list) -> str:
         "רו\"ח שייכים לדלי הכנסות; תנועות עו\"ש, אישור ניהול חשבון וריכוז יתרות "
         "שייכים לדלי מסמכי בנקים. אל תדרוש התאמת שם מילולית בדלי רחב.\n"
         "   אם קיים גם דלי רחב וגם פריט מדויק שמתאים - בחר במדויק.\n"
+        "0א. כמה קבוצות נפרדות יכולות להצביע על אותו target_index, וזה תקין "
+        "לגמרי. למשל תלושים משני מעסיקים של אותו אדם הם שני מסמכים נפרדים, "
+        "ושניהם שייכים לאותו פריט 'תלושי שכר' של אותו אדם. העובדה שכבר שייכת "
+        "קבוצה אחרת לפריט הזה אינה סיבה להשאיר את השנייה בלי שיוך.\n"
         "1. ההתאמה היא לפי מהות, לא לפי מילים. השווה סוג מסמך, מוסד, ובעל המסמך.\n"
         "2. שם הבנק ברשימה הוא השם הרשמי המלא (למשל 'בנק דיסקונט לישראל בע\"מ') "
         "ובמסמך הוא לרוב מקוצר ('דיסקונט'). זו התאמה תקפה.\n"
@@ -607,7 +611,10 @@ def _targeting_prompt(case_docs: list) -> str:
 #   thinking off   -> חוסך טוקני חשיבה, ומונע מצב שהחשיבה בולעת את כל התשובה.
 _CALL_VARIANTS = [
     {"temperature": 0, "thinking": {"type": "disabled"}},
+    {"temperature": 0.0, "thinking": {"type": "disabled"}},
+    {"thinking": {"type": "disabled"}, "extra_body": {"temperature": 0}},
     {"temperature": 0},
+    {"temperature": 0.0},
     {"extra_body": {"temperature": 0}},
     {"thinking": {"type": "disabled"}},
     {},
@@ -653,7 +660,11 @@ def _create(client: Anthropic, model: str, max_tokens: int, content: list):
             if not _is_param_error(e):
                 raise             # שגיאה אמיתית (רשת, מפתח, מכסה) – לא לבלוע
             last_err = e
-            continue              # הפרמטר נדחה – ננסה צורה פשוטה יותר
+            # שומרים את נוסח הדחייה. בלי זה אי אפשר לדעת למה פרמטר נדחה,
+            # ונשארים עם ניחושים.
+            st.session_state.setdefault("call_rejections", []).append(
+                f"{', '.join(extra.keys()) or 'ברירת מחדל'} → {str(e)[:220]}")
+            continue
     raise last_err
 
 
@@ -908,6 +919,11 @@ def render_cost_panel(prices: dict, slot=None) -> None:
         else:
             box.warning(f"מצב קריאה: {cv} — בלי temperature. התשובות עלולות "
                         "להשתנות בין הרצות על אותם קבצים.")
+            rej = st.session_state.get("call_rejections") or []
+            if rej:
+                with box.expander("🔍 למה temperature נדחה (לאבחון)"):
+                    for r in rej:
+                        st.code(r)
     if box.button("אפס מונה עלות"):
         st.session_state["usage"] = {}
         st.rerun()
@@ -1072,6 +1088,9 @@ with c2:
 if run:
     client = Anthropic(api_key=api_key)
     st.session_state.pop("last_group_raw", None)
+    st.session_state.pop("call_rejections", None)
+    st.session_state.pop("call_variant", None)
+    st.session_state.pop("call_variant_desc", None)
     files = [{"filename": f.name, "bytes": f.getvalue()} for f in uploaded]
 
     # מעבר 1 – קריאה, עם שדרוג בעת ספק
