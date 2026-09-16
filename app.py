@@ -41,7 +41,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-TOOL_BUILD = "sorter-2026-09-16-v12"         # גרסת כלי המיון (נפרד מ-BUILD של המנוע)
+TOOL_BUILD = "sorter-2026-09-16-v13"         # גרסת כלי המיון (נפרד מ-BUILD של המנוע)
 
 CHEAP_MODEL = "claude-haiku-4-5-20251001"   # דגם זול לקריאה
 PRECISE_MODEL = "claude-sonnet-5"           # דגם מדויק לשדרוג ולקיבוץ
@@ -70,7 +70,7 @@ FIELDS = {"doc_type": "אחר", "source": None, "date_start": None, "date_end": 
           "period_label": None, "account_last3": None, "property_address": None,
           "person_name": None, "business_name": None, "page_num": None, "page_total": None,
           "balance_start": None, "balance_end": None, "read_mode": "",
-          "summary": "", "confidence": 0.0}
+          "raw_error": "", "summary": "", "confidence": 0.0}
 
 # balance_start / balance_end נאספים כבר עכשיו לצורך בדיקת רצף עתידית:
 # אם יתרת הסגירה של דף אחד שווה ליתרת הפתיחה של הדף הבא - הרצף שלם, גם אם
@@ -420,19 +420,47 @@ def _track_usage(model: str, resp) -> None:
     d["calls"] += 1
 
 
-def _case_context_block(case_docs: list) -> str:
-    """טקסט הקשר קצר למעבר 1: מה התיק מחכה לו. ריק אם אין רשימה."""
-    if not case_docs:
+def people_from_docs(case_docs: list) -> list:
+    """מחלץ את שמות בעלי התיק מתוך רשימת הסאב-אייטמים.
+
+    במנוע, פריט אישי מסתיים ב"— <שם מלא>" ופריט בנקאי ב"— <שם בנק> (<בעלים>)".
+    לכן לוקחים את מה שאחרי המקף האחרון, ומסננים כל מה שנראה כמו בנק או
+    כמו הערה בסוגריים. מה שנשאר הוא שם אדם.
+    """
+    people, seen = [], set()
+    for line in case_docs:
+        for dash in ("—", "–", " - "):
+            if dash in line:
+                tail = line.rsplit(dash, 1)[1].strip()
+                break
+        else:
+            continue
+        if not tail or "(" in tail or "בנק" in tail or "טפחות" in tail:
+            continue
+        if tail not in seen:
+            seen.add(tail)
+            people.append(tail)
+    return people
+
+
+def _people_context(case_docs: list) -> str:
+    """הקשר למעבר 1: מי בעלי התיק, ותו לא.
+
+    במכוון אין כאן את רשימת המסמכים. כשהעברנו אותה, המודל נמשך להתאים את
+    המסמך שלפניו לאחד הפריטים ברשימה במקום לקרוא מה הוא באמת - ותלוש שכר
+    זוהה כדוח משכנתא רק משום שמשכנתא הופיעה ברשימה. מעבר 1 קורא את המסמך
+    כמות שהוא; ההתאמה לרשימה היא תפקידו של מעבר 2 בלבד.
+    """
+    people = people_from_docs(case_docs)
+    if not people:
         return ""
-    lines = "\n".join(f"- {d}" for d in case_docs)
     return (
-        "\nהקשר: התיק שאליו שייך המסמך ממתין למסמכים הבאים:\n" + lines +
-        "\nהשתמש בהקשר כדי לדייק את הזיהוי, אך אל תכריח התאמה: אם המסמך אינו "
-        "אחד מהם - דווח מה שהוא באמת.\n"
-        "אם מופיעים ברשימה שמות של אנשים, אלה בעלי התיק. person_name צריך "
-        "להיות אחד מהם. אם השם הבולט במסמך אינו אחד מהם, כמעט תמיד מדובר "
-        "בשם של חותם, נציג או גורם אחר ולא בבעל המסמך - חפש שוב את שם בעל "
+        "\n\nהתיק הזה שייך לאנשים הבאים: " + ", ".join(people) + ".\n"
+        "person_name צריך להיות אחד מהם. אם השם הבולט במסמך אינו אחד מהם, "
+        "כמעט תמיד מדובר בחותם, בנציג או בגורם אחר - חפש שוב את שם בעל "
         "המסמך עצמו. רק אם באמת אין התאמה, השאר ריק.\n"
+        "המידע הזה נועד אך ורק לזיהוי השם. אל תיתן לו להשפיע על doc_type: "
+        "סוג המסמך נקבע ממה שכתוב במסמך עצמו בלבד."
     )
 
 
@@ -483,7 +511,7 @@ def analyze_one(client: Anthropic, model: str, name: str, data: bytes,
         "מופיעה לעתים ברכה חתומה בשם בכיר; התעלם ממנה.\n"
         "ייתכן שקיבלת כמה תמונות של אותו קובץ. page_num מתייחס לעמוד הראשון "
         "שקיבלת, לא לאחרון."
-        + _case_context_block(case_docs)
+        + _people_context(case_docs)
     )
     resp = client.messages.create(
         model=model, max_tokens=700,
@@ -1003,6 +1031,9 @@ if run:
                    "ביטחון": round(float(m["a"].get("confidence") or 0), 2),
                    "אופן קריאה": m["a"].get("read_mode", ""),
                    "נקרא ב": m["used"]} for m in per_file],
+        "read_errors": [{"file": m["filename"], "raw": m["a"].get("raw_error", ""),
+                         "summary": m["a"].get("summary", "")}
+                        for m in per_file if m["a"].get("raw_error")],
         "n_files": len(files), "from_cache": from_cache,
         "upgraded": sum(1 for m in per_file if m["used"] == "שודרג לסונט"),
         "economical": economical,
@@ -1025,6 +1056,13 @@ if R:
         st.info(f"קריאה: {R['n_files'] - R['upgraded']} קבצים הסתדרו עם הדגם הזול, "
                 f"{R['upgraded']} שודרגו לסונט.")
     st.markdown(html_table(R["table"]), unsafe_allow_html=True)
+
+    if R.get("read_errors"):
+        with st.expander(f"⚠️ {len(R['read_errors'])} קבצים שהקריאה שלהם נכשלה "
+                         "(לאבחון)"):
+            for e in R["read_errors"]:
+                st.markdown(f"**{e['file']}** — {e['summary']}")
+                st.code(e["raw"][:1500] or "(תשובה ריקה)")
 
     def show(entry):
         cols = st.columns([3, 1])
