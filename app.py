@@ -40,7 +40,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-TOOL_BUILD = "sorter-2026-09-16-v5"         # גרסת כלי המיון (נפרד מ-BUILD של המנוע)
+TOOL_BUILD = "sorter-2026-09-16-v6"         # גרסת כלי המיון (נפרד מ-BUILD של המנוע)
 
 CHEAP_MODEL = "claude-haiku-4-5-20251001"   # דגם זול לקריאה
 PRECISE_MODEL = "claude-sonnet-5"           # דגם מדויק לשדרוג ולקיבוץ
@@ -266,6 +266,18 @@ def _file_blocks(name: str, data: bytes, only_edges: bool) -> tuple:
                   "source": {"type": "base64", "media_type": "application/pdf",
                              "data": base64.standard_b64encode(data).decode("utf-8")}}],
                 "מסמך (נפילה חזרה)")
+
+
+def _case_context_block(case_docs: list) -> str:
+    """טקסט הקשר קצר למעבר 1: מה התיק מחכה לו. ריק אם אין רשימה."""
+    if not case_docs:
+        return ""
+    lines = "\n".join(f"- {d}" for d in case_docs)
+    return (
+        "\nהקשר: התיק שאליו שייך המסמך ממתין למסמכים הבאים:\n" + lines +
+        "\nהשתמש בהקשר כדי לדייק את הזיהוי, אך אל תכריח התאמה: אם המסמך אינו "
+        "אחד מהם - דווח מה שהוא באמת.\n"
+    )
 
 
 def analyze_one(client: Anthropic, model: str, name: str, data: bytes,
