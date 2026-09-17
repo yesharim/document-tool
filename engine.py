@@ -54,8 +54,35 @@ PAYROLL_VENDORS = {"מלם שכר", "מלם", "חילן", "חילן טק", "מי
                    "עוקץ מערכות", "עוקץ", "אורורה", "הרגון", "ניסן"}
 
 
+# תיאורי מוצר, לא שם המשלם. מופיעים על תלושי קצבה ואינם מזהים גוף.
+GENERIC_SOURCES = {"קרן פנסיה", "קרן הפנסיה", "פנסיה מקיפה", "קרן פנסיה מקיפה",
+                   "קרן הפנסיה מקיפה", "פנסיה", "קצבה", "קרן השתלמות",
+                   "ביטוח מנהלים", "תלוש שכר", "שכר"}
+
+
+def _fuzzy(a: str, b: str) -> float:
+    from difflib import SequenceMatcher
+    return SequenceMatcher(None, a, b).ratio()
+
+
 def is_payroll_vendor(s) -> bool:
-    return norm_org(s) in {norm_org(v) for v in PAYROLL_VENDORS}
+    """ספק תוכנת שכר, כולל שגיאות כתיב קלות שהמודל מייצר ('מלם שכה')."""
+    n = norm_org(s)
+    if not n:
+        return False
+    for v in PAYROLL_VENDORS:
+        nv = norm_org(v)
+        if n == nv or nv in n or _fuzzy(n, nv) >= 0.8:
+            return True
+    return False
+
+
+def is_generic_source(s) -> bool:
+    n = norm_org(s)
+    if not n:
+        return False
+    return any(_fuzzy(n, norm_org(g)) >= 0.8 or norm_org(g) == n
+               for g in GENERIC_SOURCES)
 
 
 def norm_person(s) -> str:
@@ -121,14 +148,13 @@ CATEGORIES = [
     ("appraisal", dict(
         kw=["שמאות", "חוות דעת שמאי", "שומת מקרקעין", "הערכת שווי"],
         periodic=False, template="שמאות {address}")),
-    ("tabu", dict(
-        kw=["נסח טאבו", "נסח רישום", "רישום מקרקעין", "פנקס בתים משותפים",
-            "נסח"],
-        periodic=False, template="נסח טאבו {address}")),
     ("rights_confirm", dict(
         kw=["אישור זכויות", "אישור רישום", "שטר משכנת", "אישור ביצוע פעולה",
-            "חברה משכנת", "עמידר", "עמיגור"],
+            "אישור ביצוע פעולת", "חברה משכנת", "עמידר", "עמיגור", "אישור בעלות"],
         periodic=False, template="אישור זכויות {source} {address}")),
+    ("tabu", dict(
+        kw=["נסח טאבו", "נסח רישום", "פנקס בתים משותפים", "נסח"],
+        periodic=False, template="נסח טאבו {address}")),
     ("benefits", dict(
         kw=["קצבאות", "קצבה", "ביטוח לאומי", "נכות", "זכאות לקצב"],
         periodic=False, template="אישור על תשלומי קצבאות {person}")),
@@ -205,9 +231,14 @@ def sources_compatible(a, b) -> bool:
 
 
 def _source_of(a: dict) -> str:
-    """המנפיק לצורך קיבוץ. חברת סליקת שכר אינה מנפיק."""
+    """המנפיק לצורך קיבוץ.
+
+    חברת סליקת שכר אינה מנפיק, וגם לא תיאור מוצר כמו 'קרן פנסיה מקיפה' -
+    שניהם מופיעים על תלושים במקום שם המשלם, ואם נתייחס אליהם כמנפיק,
+    תלושים של אותו אדם יתפצלו לכמה קבצים.
+    """
     s = a.get("source")
-    return "" if is_payroll_vendor(s) else (s or "")
+    return "" if (is_payroll_vendor(s) or is_generic_source(s)) else (s or "")
 
 
 def split_by_source(members: list) -> list:
@@ -365,11 +396,10 @@ def build_name(group: dict) -> str:
     for m in members:
         months |= _months(m["a"])
 
-    src = first.get("source") or ""
-    if is_payroll_vendor(src):
-        src = next((m["a"].get("source") for m in members
-                    if m["a"].get("source")
-                    and not is_payroll_vendor(m["a"].get("source"))), "")
+    # לשם הקובץ בוחרים את המנפיק האמיתי הראשון שנמצא בקבוצה, ולא את זה של
+    # הקובץ הראשון: הוא עלול להיות חברת סליקה או תיאור מוצר.
+    src = next((m["a"].get("source") for m in members
+                if _source_of(m["a"]).strip()), "")
     if cat in ("bank_statement", "bank_account_confirm", "bank_loans",
                "bank_balances", "mortgage_payoff", "mortgage_history"):
         src = short_bank(src)
@@ -449,34 +479,46 @@ def assign(groups: list, case_docs: list) -> None:
             gpeople |= m["a"]["_people"]
         gyear = _year(first)
 
-        best, best_score, why = None, 0, ""
+        cands = []
         for p in parsed:
             if p["cat"] != g["cat"] or p["cat"] == "other":
                 continue
-            score, notes = 3, []
+            # התאמת קטגוריה לבדה היא כבר שיוך תקף; כל אימות נוסף מחזק.
+            score, notes = 0.7, []
 
             if p["bank"]:
                 if norm_org(short_bank(p["bank"])) == norm_org(gsrc) and gsrc:
-                    score += 3
+                    score += 0.1
                     notes.append("בנק תואם")
                 elif gsrc:
                     continue          # בנק אחר - פסול, לא רק פחות מתאים
             if p["people"]:
                 if gpeople & p["people"]:
-                    score += 2
+                    score += 0.1
                     notes.append("שם תואם")
                 elif gpeople and not p["joint"]:
                     continue          # אדם אחר - פסול
             if p["year_hint"]:
                 if _year_matches(p["year_hint"], gyear):
-                    score += 2
+                    score += 0.1
                     notes.append("שנה תואמת")
                 else:
                     continue
-            if score > best_score:
-                best, best_score, why = p, score, ", ".join(notes)
+            cands.append((score, p, ", ".join(notes)))
 
-        g["target"] = best["raw"] if best else None
+        if not cands:
+            g["target"], g["target_conf"], g["target_reason"] = None, 0.0, ""
+            continue
+
+        cands.sort(key=lambda c: -c[0])
+        score, best, why = cands[0]
+
+        # שני מועמדים באותו ניקוד = הרשימה עצמה אינה מבחינה ביניהם. מורידים
+        # ודאות כדי שהקובץ יעבור לבדיקה ידנית במקום להיות משויך בהגרלה.
+        if len(cands) > 1 and abs(cands[1][0] - score) < 1e-9:
+            score -= 0.25
+            why = (why + ", יש יותר מפריט מתאים").strip(", ")
+
+        g["target"] = best["raw"]
         g["target_reason"] = why
-        # ודאות נגזרת מכמה מרכיבים אומתו, ולא ממספר שהמודל המציא
-        g["target_conf"] = round(min(best_score / 10.0, 0.99), 2) if best else 0.0
+        g["target_conf"] = round(min(score, 0.99), 2)
