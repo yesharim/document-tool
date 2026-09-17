@@ -29,8 +29,18 @@ import streamlit as st
 from anthropic import Anthropic
 
 # מנוע הקיבוץ, השיוך ומתן-השמות. קוד דטרמיניסטי, מכוסה בבדיקות ב-test_engine.py
-# ייבוא המנוע. אם הקובץ שבמאגר ישן מהאפליקציה, נעדיף הודעה ברורה בעברית
-# על פני קריסה עם שגיאה מוצפנת.
+#
+# טעינה מחדש בכפייה: סטרימליט מריצה מחדש את app.py בכל שינוי, אבל מודול
+# שיובא כבר נשאר בזיכרון של התהליך. התוצאה היא app.py חדש מול engine.py
+# ישן, ושגיאת ייבוא שנראית כאילו הקובץ לא הועלה - בזמן שבמאגר הוא תקין.
+try:
+    import importlib
+    import engine as _engine_mod
+    importlib.reload(_engine_mod)
+except Exception:
+    pass
+
+# אם הקובץ שבמאגר ישן מהאפליקציה, נעדיף הודעה ברורה בעברית על פני קריסה.
 try:
     from engine import (build_groups, assign, build_name, group_confidence,
                         CATEGORIES, ENGINE_BUILD)
@@ -67,7 +77,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-TOOL_BUILD = "sorter-2026-09-17-v33"         # גרסת כלי המיון (נפרד מ-BUILD של המנוע)
+TOOL_BUILD = "sorter-2026-09-17-v34"         # גרסת כלי המיון (נפרד מ-BUILD של המנוע)
 
 CHEAP_MODEL = "claude-haiku-4-5-20251001"   # דגם זול לקריאה
 PRECISE_MODEL = "claude-sonnet-5"           # דגם מדויק לשדרוג ולקיבוץ
