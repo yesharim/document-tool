@@ -16,7 +16,7 @@
     - מה שאין לו יעד ברור -> בדיקה ידנית עם שם נכון, בלי ניחוש
 """
 
-ENGINE_BUILD = "engine-2026-09-17-v34"
+ENGINE_BUILD = "engine-2026-09-17-v35"
 
 import re
 import unicodedata

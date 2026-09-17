@@ -36,7 +36,9 @@ from anthropic import Anthropic
 try:
     import importlib
     import engine as _engine_mod
+    import reader as _reader_mod
     importlib.reload(_engine_mod)
+    importlib.reload(_reader_mod)
 except Exception:
     pass
 
@@ -77,7 +79,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-TOOL_BUILD = "sorter-2026-09-17-v34"         # גרסת כלי המיון (נפרד מ-BUILD של המנוע)
+TOOL_BUILD = "sorter-2026-09-17-v35"         # גרסת כלי המיון (נפרד מ-BUILD של המנוע)
 
 CHEAP_MODEL = "claude-haiku-4-5-20251001"   # דגם זול לקריאה
 PRECISE_MODEL = "claude-sonnet-5"           # דגם מדויק לשדרוג ולקיבוץ
