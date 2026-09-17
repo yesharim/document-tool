@@ -16,7 +16,7 @@
     - מה שאין לו יעד ברור -> בדיקה ידנית עם שם נכון, בלי ניחוש
 """
 
-ENGINE_BUILD = "engine-2026-09-17-v38"
+ENGINE_BUILD = "engine-2026-09-17-v39"
 
 import re
 import unicodedata
@@ -596,6 +596,11 @@ def find_gaps(group: dict) -> list:
     return gaps
 
 
+# תוספת ביטחון לסדרת עמודים מלאה. מספור רצוף מ-1 עד הסוף הוא ראיה
+# עצמאית לשלמות המסמך, ואינו תלוי באיכות הצילום.
+COMPLETE_SERIES_BONUS = 0.15
+
+
 def group_confidence(group: dict) -> float:
     """ביטחון הזיהוי של הקבוצה כולה.
 
@@ -609,16 +614,22 @@ def group_confidence(group: dict) -> float:
         return 0.0
 
     # סדרת עמודים שלמה: הביטחון נקבע לפי העמוד החזק ביותר, לרוב עמוד
-    # הכותרת. עמוד אמצעי של דוח תנועות אינו נושא מידע מזהה ולכן מדווח
-    # ביטחון נמוך - אבל המספור הרצוף מוכיח שהוא חלק מאותו מסמך, וזו
-    # ראיה חזקה יותר מהביטחון של כל עמוד בנפרד.
+    # הכותרת, ובתוספת בונוס.
+    #
+    # למה בונוס: צילום בוואטסאפ מדווח ביטחון נמוך מ-PDF - התמונה מוטה,
+    # חתוכה או מעוותת - ולכן גם עמוד כותרת ברור יוצא סביב 0.6 ונופל מתחת
+    # לסף. אבל כשכל העמודים כאן וממוספרים ברצף מ-1 עד הסוף, המסמך הוכיח
+    # את עצמו: המספור הרצוף הוא ראיה חזקה יותר מכל ניקוד שהמודל נותן
+    # לעצמו. הבונוס ניתן רק לסדרה מלאה - לא לחלקית, ולא לקובץ בודד.
     nums = [m["a"].get("page_num") for m in members]
     total = next((m["a"].get("page_total") for m in members
                   if isinstance(m["a"].get("page_total"), int)), None)
-    if (total and len(members) == total
+    # לפחות שני עמודים: מסמך בן עמוד אחד אינו "סדרה", ואין בו שום
+    # אישוש הדדי שיצדיק בונוס.
+    if (total and total > 1 and len(members) == total
             and all(isinstance(n, int) for n in nums)
             and sorted(nums) == list(range(1, total + 1))):
-        return max(vals)
+        return round(min(max(vals) + COMPLETE_SERIES_BONUS, 0.99), 2)
 
     n = len(vals)
     return vals[n // 2] if n % 2 else (vals[n // 2 - 1] + vals[n // 2]) / 2

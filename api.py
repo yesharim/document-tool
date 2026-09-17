@@ -14,7 +14,7 @@
     POST /sort        החבילה המלאה. זו הנקודה ש-Make משתמש בה
 """
 
-API_BUILD = "api-2026-09-17-v38"
+API_BUILD = "api-2026-09-17-v39"
 
 import base64
 import os
