@@ -22,10 +22,14 @@ import json
 import hashlib
 import base64
 import zipfile
+from datetime import date
 
 import fitz  # PyMuPDF
 import streamlit as st
 from anthropic import Anthropic
+
+# מנוע הקיבוץ, השיוך ומתן-השמות. קוד דטרמיניסטי, מכוסה בבדיקות ב-test_engine.py
+from engine import build_groups, assign, build_name, CATEGORIES
 
 # ------------------------------------------------------------------ הגדרות בסיס
 st.set_page_config(page_title="מיון וקיבוץ מסמכים", page_icon="🗂️", layout="wide")
@@ -41,7 +45,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-TOOL_BUILD = "sorter-2026-09-17-v27"         # גרסת כלי המיון (נפרד מ-BUILD של המנוע)
+TOOL_BUILD = "sorter-2026-09-17-v30"         # גרסת כלי המיון (נפרד מ-BUILD של המנוע)
 
 CHEAP_MODEL = "claude-haiku-4-5-20251001"   # דגם זול לקריאה
 PRECISE_MODEL = "claude-sonnet-5"           # דגם מדויק לשדרוג ולקיבוץ
@@ -451,6 +455,24 @@ def people_from_docs(case_docs: list) -> list:
     return people
 
 
+_HEB_MONTHS = ("ינואר", "פברואר", "מרץ", "אפריל", "מאי", "יוני", "יולי",
+               "אוגוסט", "ספטמבר", "אוקטובר", "נובמבר", "דצמבר")
+
+
+def today_context() -> str:
+    """מוסר למודל מה התאריך היום.
+
+    בלי זה אי אפשר להכריע מה היא 'שנה נוכחית', 'שנה קודמת' או 'שלושה חודשים
+    אחרונים' - וזה בדיוק מה שהכשיל את שיוך שומת המס.
+    """
+    t = date.today()
+    return (f"\n\nהיום {t.day} ב{_HEB_MONTHS[t.month - 1]} {t.year} "
+            f"(בפורמט מספרי {t.isoformat()}).\n"
+            f"לכן השנה הנוכחית היא {t.year}, שנה קודמת {t.year - 1}, "
+            f"ושנתיים אחורה {t.year - 2}. חשב לפי זה כל ביטוי יחסי של זמן - "
+            f"שנה נוכחית, שנה קודמת, שלושה חודשים אחרונים - ואל תנחש.\n")
+
+
 def _people_context(case_docs: list) -> str:
     """הקשר למעבר 1: מי בעלי התיק, ותו לא.
 
@@ -553,6 +575,7 @@ def analyze_one(client: Anthropic, model: str, name: str, data: bytes,
         "מופיעה לעתים ברכה חתומה בשם בכיר; התעלם ממנה.\n"
         "ייתכן שקיבלת כמה תמונות של אותו קובץ. page_num מתייחס לעמוד הראשון "
         "שקיבלת, לא לאחרון."
+        + today_context()
         + _people_context(case_docs)
     )
     resp = _create(client, model, 3000,
@@ -581,71 +604,6 @@ def analyze_one(client: Anthropic, model: str, name: str, data: bytes,
     return result
 
 
-def _attach_target(group: dict, case_docs: list) -> None:
-    """ממיר target_index למחרוזת השם המדויקת של הסאב-אייטם.
-
-    מוודא שהאינדקס תקין ובטווח. כל ערך אחר (null, מחוץ לטווח, לא מספר) הופך
-    ל-target=None, כלומר "מסמכים נוספים". עדיף לא לשייך מאשר לשייך לא נכון.
-    """
-    group.setdefault("note", "")
-    if not case_docs:
-        group["target"], group["target_conf"] = None, 0.0
-        return
-    idx = group.get("target_index")
-    try:
-        idx = int(idx)
-    except (TypeError, ValueError):
-        idx = None
-    if idx is None or not (0 <= idx < len(case_docs)):
-        group["target"], group["target_conf"] = None, 0.0
-        return
-    group["target"] = case_docs[idx]
-    try:
-        group["target_conf"] = float(group.get("target_confidence") or 0.0)
-    except (TypeError, ValueError):
-        group["target_conf"] = 0.0
-
-
-def _targeting_prompt(case_docs: list) -> str:
-    """הנחיית השיוך לסאב-אייטם. ריקה כשאין רשימה (אז הכלי מתנהג כמו קודם)."""
-    if not case_docs:
-        return ""
-    menu = "\n".join(f"{i}. {d}" for i, d in enumerate(case_docs))
-    return (
-        "שיוך לסאב-אייטם\n"
-        "התיק ממתין למסמכים הבאים, ממוספרים:\n" + menu + "\n\n"
-        "לכל קבוצה החזר target_index – המספר מהרשימה שאליו המסמך שייך, "
-        "ו-target_confidence בין 0 ל-1.\n"
-        "כללי השיוך:\n"
-        "0. פריט ברשימה יכול להיות שם מסמך מדויק ('עובר ושב 3 חודשים - בנק "
-        "דיסקונט') או דלי-קטגוריה רחב ('מסמכי בנקים', 'מסמכי הכנסות', "
-        "'אישור זכויות'). זהה לבד באיזה סוג מדובר.\n"
-        "   כשהפריט הוא דלי-קטגוריה - שייך אליו כל מסמך שנופל בקטגוריה, גם אם "
-        "שמו המדויק שונה. דוגמאות: נסח טאבו, אישור זכויות, שובר ארנונה וצו רישום "
-        "בית שייכים כולם לדלי של מסמכי זכויות בנכס; תלוש שכר, טופס 106 ואישור "
-        "רו\"ח שייכים לדלי הכנסות; תנועות עו\"ש, אישור ניהול חשבון וריכוז יתרות "
-        "שייכים לדלי מסמכי בנקים. אל תדרוש התאמת שם מילולית בדלי רחב.\n"
-        "   אם קיים גם דלי רחב וגם פריט מדויק שמתאים - בחר במדויק.\n"
-        "0א. כמה קבוצות נפרדות יכולות להצביע על אותו target_index, וזה תקין "
-        "לגמרי. למשל תלושים משני מעסיקים של אותו אדם הם שני מסמכים נפרדים, "
-        "ושניהם שייכים לאותו פריט 'תלושי שכר' של אותו אדם. העובדה שכבר שייכת "
-        "קבוצה אחרת לפריט הזה אינה סיבה להשאיר את השנייה בלי שיוך.\n"
-        "1. ההתאמה היא לפי מהות, לא לפי מילים. השווה סוג מסמך, מוסד, ובעל המסמך.\n"
-        "2. שם הבנק ברשימה הוא השם הרשמי המלא (למשל 'בנק דיסקונט לישראל בע\"מ') "
-        "ובמסמך הוא לרוב מקוצר ('דיסקונט'). זו התאמה תקפה.\n"
-        "3. חוק ברזל: אם ברשימה יש כמה פריטים מאותו סוג שנבדלים בשם האדם או בבנק – "
-        "חייבים להתאים גם את השם וגם את הבנק. אל תבחר על סמך הסוג בלבד.\n"
-        "   זה חל גם על דליים: אם יש 'מסמכי הכנסות' וגם 'מסמכי הכנסות של האישה', "
-        "הכרעה לפי person_name היא חובה. אם השם במסמך לא זוהה - "
-        "החזר null ואל תנחש מי מבני הזוג.\n"
-        "4. אם אין התאמה ברורה, או שיש שתי אפשרויות ואינך יכול להכריע – "
-        "החזר target_index: null. זו תשובה נכונה ועדיפה על ניחוש; "
-        "הקובץ יטופל ידנית. אל תכריח שיוך.\n"
-        "5. target_confidence נפרד מ-confidence: אפשר לזהות מסמך בוודאות מלאה "
-        "ועדיין לא לדעת לאיזה פריט הוא שייך.\n\n"
-    )
-
-
 # צורות הקריאה לפי סדר עדיפות. גרסאות שונות של הספרייה ושל המודל מקבלות
 # פרמטרים שונים, וסטרימליט מושכת את הגרסה שיש ברגע הפריסה.
 #
@@ -659,7 +617,6 @@ _CALL_VARIANTS = [
     {},
 ]
 
-
 def _is_param_error(e: Exception) -> bool:
     """האם השגיאה נובעת מפרמטר שלא התקבל, ולא מתקלה אמיתית.
 
@@ -672,6 +629,7 @@ def _is_param_error(e: Exception) -> bool:
     if getattr(e, "status_code", None) == 400:
         return True
     return "BadRequest" in type(e).__name__
+
 
 
 def _create(client: Anthropic, model: str, max_tokens: int, content: list):
@@ -707,6 +665,7 @@ def _create(client: Anthropic, model: str, max_tokens: int, content: list):
     raise last_err
 
 
+
 def _text_of(resp) -> str:
     """מחלץ את הטקסט מהתשובה. כשאין בלוק טקסט כלל, מחזיר דיווח אבחוני
     במקום מחרוזת ריקה - תשובה ריקה בלי הסבר היא הדבר הכי קשה לאבחן."""
@@ -721,166 +680,6 @@ def _text_of(resp) -> str:
     return (f"[אבחון] לא הוחזר טקסט. סוגי בלוקים: {kinds}. "
             f"סיבת עצירה: {stop}. טוקני פלט: {out}.")
 
-
-def _parse_groups(raw: str, allowed: set) -> list:
-    """מפענח את תשובת שלב הקיבוץ: קודם פורמט שורות, ואם אין - JSON."""
-    groups = [g for g in parse_kv(raw, allowed) if g.get("indices")]
-    if groups:
-        return groups
-    try:
-        data = _extract_json(raw)
-        if isinstance(data, dict):
-            return [g for g in data.get("groups", []) if g.get("indices")]
-    except Exception:
-        pass
-    return []
-
-
-def group_files(client: Anthropic, model: str, per_file: list, naming_rules: str,
-                case_docs: list = None):
-    """מעבר 2 – קיבוץ, שיוך לסאב-אייטם ומתן-שמות. מחזיר (קבוצות, שגיאה_אם_יש).
-
-    כשמועברת רשימת סאב-אייטמים (case_docs), כל קבוצה מקבלת גם target_index –
-    אינדקס מתוך הרשימה, או null אם אין התאמה ברורה. עבודה באינדקס ולא במחרוזת
-    מונעת אי-התאמות של ניסוח (למשל "בנק דיסקונט" מול "בנק דיסקונט לישראל בע״מ").
-    """
-    case_docs = case_docs or []
-    payload = [
-        {"index": i, "filename": f["filename"],
-         "file_pages": f.get("file_pages", 1),
-         **{k: f["a"].get(k) for k in FIELDS if k != "read_mode"}}
-        for i, f in enumerate(per_file)
-    ]
-    prompt = (
-        "קיבלת רשימת דפים/קבצים שלקוח שלח. קבץ יחד קבצים שהם אותו מסמך לוגי.\n\n"
-        "סימני היכר לאותו מסמך:\n"
-        "1. מספור דפים – זה הסימן החזק ביותר. אם page_total זהה (למשל כמה דפים עם 'מתוך 5'), "
-        "ואותו סוג ומקור – זה מסמך אחד, וכל הדפים 1..page_total שייכים לו.\n"
-        "2. אותו סוג מסמך + אותו מקור (בנק) + אותו מספר חשבון.\n"
-        "3. תאריכים רציפים או חופפים.\n\n"
-        "file_pages = מספר העמודים האמיתי בקובץ, נמדד ולא משוער. אם file_pages "
-        "שווה ל-page_total, הקובץ שלם ואין עמודים חסרים - אל תדווח חוסר.\n"
-        "שים לב: שני מסמכים מאותו בנק אך בטווחי תאריכים שונים = שני מסמכים נפרדים.\n"
-        "חריג חשוב - מסמכים תקופתיים שנדרשים כסדרה: תלושי שכר, וכן כל מסמך "
-        "שהסאב-אייטם מבקש ממנו כמה חודשים ('3 חודשים אחרונים'). תלושים של אותו "
-        "אדם ואותו מעסיק בחודשים עוקבים הם מסמך לוגי אחד ויש לאחד אותם לקבוצה "
-        "אחת, שתמוזג לקובץ אחד. הכלל של 'טווחי תאריכים שונים = מסמכים נפרדים' "
-        "אינו חל עליהם.\n"
-        "לעומת זאת תלושים של שני אנשים שונים לעולם לא באותה קבוצה.\n"
-        "חוק ברזל א: לעולם אל תשים באותה קבוצה מסמכים של שני אנשים שונים.\n"
-        "לפני שאתה מפצל לפי מנפיק, ודא שאלה באמת שני גופים שונים ולא אותו "
-        "גוף בשני ניסוחים: קיצור מול שם מלא, צורת התאגדות שונה, או חברת "
-        "סליקת שכר שהודפסה על התלוש במקום שם המעסיק. אותו אדם, אותו סכום "
-        "בסיס ואותה סדרת חודשים - כמעט תמיד אותו מעסיק.\n"
-        "חוק ברזל ב: לעולם אל תשים באותה קבוצה מסמכים משני מנפיקים שונים "
-        "(source שונה) - שני מעסיקים שונים, שני בנקים שונים. אדם אחד יכול "
-        "לעבוד בשני מקומות באותו חודש, ואלה שני מסמכים נפרדים שכל אחד מהם "
-        "מקבל קובץ משלו. אם source של אחד ריק ושל השני מלא - אל תניח שהם "
-        "זהים; השאר אותם בנפרד.\n"
-        "שני מסמכים נפרדים יכולים להיות משויכים לאותו סאב-אייטם. זה תקין "
-        "ואינו סיבה לאחד אותם.\n"
-        "שם האדם מופיע לרוב רק בדף הראשון; אם דף אחד בקבוצה מכיל person_name – הוא תקף לכל הקבוצה.\n"
-        "בשם הקובץ: קח את התאריך המוקדם ביותר ואת המאוחר ביותר מכל דפי הקבוצה.\n"
-        "אם המסמך ברור – תן confidence גבוה (0.8-1). הורד רק אם באמת לא ברור.\n\n"
-        f"{naming_rules}\n\n"
-        + _targeting_prompt(case_docs) +
-        "הקבצים:\n" + json.dumps(payload, ensure_ascii=False, indent=1)
-        + "\n\n"
-        "פורמט התשובה: לכל קבוצה בלוק שמתחיל בשורת --- ואחריו שדות, כל שדה\n"
-        "בשורה נפרדת בפורמט 'מפתח: ערך'. בלי JSON, בלי מרכאות מסביב לערכים,\n"
-        "ובלי טקסט נוסף לפני או אחרי. לדוגמה:\n\n"
-        "---\n"
-        "indices: 0,1,2\n"
-        "doc_type: תלושי שכר\n"
-        "final_name: תלושים 05-07 טלי\n"
-        "confidence: 0.95\n"
-        "target_index: 1\n"
-        "target_confidence: 0.9\n"
-        "note: \n"
-        "---\n"
-        "indices: 3\n"
-        "doc_type: תנועות עו״ש\n"
-        "final_name: תנועות עוש 04.06-05.08 מזרחי אנדרגה\n"
-        "confidence: 0.9\n"
-        "target_index: \n"
-        "target_confidence: 0\n"
-        "note: לא נמצא יעד מתאים\n\n"
-        "כל קובץ חייב להופיע בקבוצה אחת בדיוק. סדר את ה-indices לפי page_num "
-        "(ואם אין – לפי תאריך). target_index ריק פירושו שאין התאמה.\n\n"
-    )
-    try:
-        resp = _create(client, model, 16000, [{"type": "text", "text": prompt}])
-        _track_usage(model, resp)
-        raw = _text_of(resp)
-        stop = getattr(resp, "stop_reason", None)
-        allowed = {"indices", "doc_type", "final_name", "confidence",
-                   "target_index", "target_confidence", "note"}
-        st.session_state["last_group_raw"] = raw
-        groups = _parse_groups(raw, allowed)
-
-        # ניסיון חוזר אחד עם הנחיה מינימלית. כשהתשובה אינה בפורמט המבוקש,
-        # לרוב הסיבה היא הנחיה ארוכה מדי - ובקשה קצרה וממוקדת מצליחה.
-        if not groups:
-            retry = (
-                "התשובה הקודמת לא הייתה בפורמט הנדרש. החזר שוב, "
-                "בפורמט הזה בלבד, בלי שום טקסט אחר:\n\n"
-                "---\n"
-                "indices: 0,1\n"
-                "doc_type: סוג\n"
-                "final_name: שם הקובץ\n"
-                "confidence: 0.9\n"
-                "target_index: 2\n"
-                "target_confidence: 0.9\n"
-                "note: \n\n"
-                "בלוק אחד לכל מסמך לוגי. כל אינדקס מרשימת הקבצים חייב להופיע "
-                "בדיוק פעם אחת. אל תוסיף שום הסבר.\n\n"
-                + _targeting_prompt(case_docs) +
-                "הקבצים:\n" + json.dumps(payload, ensure_ascii=False, indent=1)
-            )
-            resp2 = _create(client, model, 16000, [{"type": "text", "text": retry}])
-            _track_usage(model, resp2)
-            raw2 = _text_of(resp2)
-            st.session_state["last_group_raw"] = raw + "\n\n=== ניסיון חוזר ===\n" + raw2
-            groups = _parse_groups(raw2, allowed)
-            stop = getattr(resp2, "stop_reason", None)
-
-        if not groups:
-            why = " (התשובה נחתכה באמצע - מגבלת אורך)" if stop == "max_tokens" else ""
-            raise ValueError("התשובה לא הייתה בפורמט הנדרש" + why)
-        # ודא שכל קובץ שויך; מה שנשמט – לקבוצה משלו
-        seen = {i for g in groups for i in g.get("indices", [])}
-        for i in range(len(per_file)):
-            if i not in seen:
-                groups.append({"indices": [i], "doc_type": per_file[i]["a"].get("doc_type"),
-                               "final_name": per_file[i]["filename"].rsplit(".", 1)[0],
-                               "confidence": 0.0, "note": "לא שויך לקבוצה"})
-        for g in groups:
-            _attach_target(g, case_docs)
-        err = None
-        if stop == "max_tokens":
-            err = ("התשובה נחתכה באמצע כי הגיעה למגבלת האורך – ייתכן שהקיבוץ "
-                   "חלקי. אם זה חוזר, כדאי לצמצם את כללי מתן-השמות.")
-        return groups, err
-    except Exception as e:
-        # נפילה חזרה: קבוצה לכל קובץ, אבל עם שם שנבנה מנתוני מעבר 1 ולא משם
-        # הקובץ המקורי (שהוא לרוב ג'יבריש מהוואטסאפ). כך גם כשהקיבוץ נכשל,
-        # התוצאה עדיין שמישה ואפשר להעלות ידנית.
-        fallback = []
-        for i, f in enumerate(per_file):
-            a = f["a"]
-            parts = [a.get("doc_type") or "מסמך"]
-            if a.get("period_label"):
-                parts.append(str(a["period_label"]))
-            if a.get("source"):
-                parts.append(str(a["source"]))
-            if a.get("person_name"):
-                parts.append(str(a["person_name"]))
-            fallback.append({"indices": [i], "doc_type": a.get("doc_type", "אחר"),
-                             "final_name": " ".join(parts),
-                             "confidence": float(a.get("confidence") or 0),
-                             "target": None, "target_conf": 0.0,
-                             "note": "הקיבוץ נכשל – קובץ בודד, בלי שיוך"})
-        return fallback, f"שלב הקיבוץ נכשל: {type(e).__name__}: {e}"
 
 
 def merge_to_pdf(files_bytes: list, names: list) -> bytes:
@@ -1041,7 +840,12 @@ with st.sidebar:
             )
 
     st.divider()
-    naming_rules = st.text_area("כללי מתן-שמות (ניתן לעריכה)", DEFAULT_NAMING_RULES, height=300)
+    with st.expander("תבניות שמות הקבצים"):
+        st.caption("השמות נבנים בקוד לפי התבניות האלה, ולא על ידי המודל. "
+                   "לשינוי תבנית - יש לערוך את engine.py.")
+        st.markdown(html_table(
+            [{"סוג מסמך": cid, "תבנית": spec["template"]}
+             for cid, spec in CATEGORIES]), unsafe_allow_html=True)
 
     st.divider()
     st.subheader("עלות")
@@ -1180,7 +984,21 @@ if run:
         prog.progress((i + 1) / len(files), text=f"נקרא: {f['filename']}")
     prog.progress(1.0, text="מקבץ ונותן שמות...")
 
-    groups, group_err = group_files(client, PRECISE_MODEL, per_file, naming_rules, case_docs)
+    # קיבוץ, שיוך ומתן-שמות - בקוד, בלי קריאה למודל. הלוגיקה ב-engine.py
+    # ומכוסה בבדיקות, ולכן אותו קלט נותן תמיד אותו פלט.
+    eng_groups = build_groups(per_file)
+    assign(eng_groups, case_docs)
+    groups, group_err = [], None
+    for g in eng_groups:
+        conf = [float(m["a"].get("confidence") or 0) for m in g["members"]]
+        groups.append({
+            "indices": [m["index"] for m in g["members"]],
+            "doc_type": g["members"][0]["a"].get("doc_type", ""),
+            "final_name": build_name(g),
+            "confidence": min(conf) if conf else 0.0,
+            "target": g["target"], "target_conf": g["target_conf"],
+            "note": g.get("target_reason", ""),
+        })
     if group_err:
         st.error(f"⚠️ {group_err}")
         dbg = st.session_state.get("last_group_raw")
