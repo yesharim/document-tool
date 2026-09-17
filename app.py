@@ -29,10 +29,31 @@ import streamlit as st
 from anthropic import Anthropic
 
 # מנוע הקיבוץ, השיוך ומתן-השמות. קוד דטרמיניסטי, מכוסה בבדיקות ב-test_engine.py
-from engine import (build_groups, assign, build_name, group_confidence,
-                    CATEGORIES, ENGINE_BUILD)
+# ייבוא המנוע. אם הקובץ שבמאגר ישן מהאפליקציה, נעדיף הודעה ברורה בעברית
+# על פני קריסה עם שגיאה מוצפנת.
+try:
+    from engine import (build_groups, assign, build_name, group_confidence,
+                        CATEGORIES, ENGINE_BUILD)
+    _ENGINE_ERR = None
+except ImportError as _e:
+    _ENGINE_ERR = str(_e)
+    ENGINE_BUILD = "לא נטען"
+    CATEGORIES = []
+
+    def build_groups(*a, **k):
+        raise RuntimeError("engine.py אינו תואם")
+
+    def assign(*a, **k):
+        raise RuntimeError("engine.py אינו תואם")
+
+    def build_name(*a, **k):
+        raise RuntimeError("engine.py אינו תואם")
+
+    def group_confidence(*a, **k):
+        return 0.0
 
 # ------------------------------------------------------------------ הגדרות בסיס
+_GUARD = True
 st.set_page_config(page_title="מיון וקיבוץ מסמכים", page_icon="🗂️", layout="wide")
 
 st.markdown(
@@ -778,6 +799,17 @@ def safe_filename(name: str) -> str:
 
 
 st.title("🗂️ מיון, קיבוץ ומתן-שמות למסמכים")
+if _ENGINE_ERR:
+    st.error(
+        "קובץ engine.py שבמאגר ישן ואינו תואם לגרסת האפליקציה.\n\n"
+        f"פרטים: {_ENGINE_ERR}\n\n"
+        "מה לעשות: לפתוח את המאגר בגיטהאב, לוודא שקיים קובץ אחד בשם "
+        "engine.py (ולא engine (1).py), ולהעלות מחדש את הגרסה העדכנית. "
+        "בראש הקובץ צריכה להופיע השורה ENGINE_BUILD עם אותו מספר גרסה "
+        f"כמו {TOOL_BUILD}."
+    )
+    st.stop()
+
 st.caption("העלי את כל הקבצים של לקוח. הכלי מזהה, מקבץ, נותן שם וממזג כל קבוצה ל-PDF אחד להורדה.")
 
 with st.sidebar:
