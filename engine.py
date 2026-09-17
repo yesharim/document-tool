@@ -16,6 +16,8 @@
     - מה שאין לו יעד ברור -> בדיקה ידנית עם שם נכון, בלי ניחוש
 """
 
+ENGINE_BUILD = "engine-2026-09-17-v32"
+
 import re
 import unicodedata
 from datetime import date
@@ -169,12 +171,33 @@ CATEGORIES = [
 CAT_BY_ID = dict(CATEGORIES)
 
 
+def _kw_hit(kw: str, hay: str) -> bool:
+    """התאמת מילת מפתח לפי גבולות מילה ולא כתת-מחרוזת.
+
+    בלי זה 'שומה' נמצא בתוך 'רשומה', ונסח טאבו שסיכומו מזכיר זכויות רשומות
+    מסווג כשומת מס. תת-מחרוזת היא מקור שקט לסיווגים שגויים.
+    """
+    k = norm(kw)
+    if not k:
+        return False
+    # גבול שמאלי מחמיר: מונע את הבאג שבו 'שומה' נמצא בתוך 'רשומה'.
+    # גבול ימני מקל: מרשה עד שתי אותיות נוספות, כדי ש'תלוש' יתפוס גם
+    # 'תלושים' ו'משכנת' גם 'משכנתא' - הטיות רגילות בעברית.
+    return re.search(r"(?<![\w֐-׿])" + re.escape(k) +
+                     r"(?![\w֐-׿]{3,})", hay) is not None
+
+
 def classify(doc_type: str, summary: str = "") -> str:
-    """ממפה תיאור חופשי מהמודל לקטגוריה סגורה. 'other' אם אין התאמה."""
-    hay = norm(doc_type) + " " + norm(summary)
-    for cid, spec in CATEGORIES:
-        for k in spec["kw"]:
-            if norm(k) in hay:
+    """ממפה תיאור חופשי מהמודל לקטגוריה סגורה. 'other' אם אין התאמה.
+
+    doc_type מנצח תמיד: הוא מה שהמודל קבע שהמסמך הוא. הסיכום נבדק רק אם
+    doc_type לא הכריע, כי הוא טקסט חופשי ועלול להזכיר מונחים שאינם הנושא.
+    """
+    for hay in (norm(doc_type), norm(summary)):
+        if not hay:
+            continue
+        for cid, spec in CATEGORIES:
+            if any(_kw_hit(k, hay) for k in spec["kw"]):
                 return cid
     return "other"
 
@@ -272,6 +295,10 @@ def group_key(a: dict) -> tuple:
     parts = [cid, "|".join(sorted(people))]
     if not spec.get("periodic", False):
         parts.append(_year(a))
+        # בקטגוריות שמכילות כמה מסמכים שונים במהותם - אישור זכויות, שטר
+        # משכנתא, אישור ביצוע פעולה - אסור לאחד רק כי הקטגוריה משותפת.
+        if cid in ("rights_confirm", "tabu", "appraisal", "benefits"):
+            parts.append(norm(a.get("doc_type")))
         if cid in ("bank_statement", "bank_account_confirm", "bank_loans",
                    "bank_balances"):
             parts.append(str(a.get("account_last3") or ""))

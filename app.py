@@ -29,7 +29,8 @@ import streamlit as st
 from anthropic import Anthropic
 
 # מנוע הקיבוץ, השיוך ומתן-השמות. קוד דטרמיניסטי, מכוסה בבדיקות ב-test_engine.py
-from engine import build_groups, assign, build_name, CATEGORIES
+from engine import (build_groups, assign, build_name, CATEGORIES,
+                    ENGINE_BUILD)
 
 # ------------------------------------------------------------------ הגדרות בסיס
 st.set_page_config(page_title="מיון וקיבוץ מסמכים", page_icon="🗂️", layout="wide")
@@ -45,7 +46,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-TOOL_BUILD = "sorter-2026-09-17-v31"         # גרסת כלי המיון (נפרד מ-BUILD של המנוע)
+TOOL_BUILD = "sorter-2026-09-17-v32"         # גרסת כלי המיון (נפרד מ-BUILD של המנוע)
 
 CHEAP_MODEL = "claude-haiku-4-5-20251001"   # דגם זול לקריאה
 PRECISE_MODEL = "claude-sonnet-5"           # דגם מדויק לשדרוג ולקיבוץ
@@ -867,6 +868,9 @@ with st.sidebar:
     cost_slot = st.empty()
 
     st.caption(f"גרסת כלי: {TOOL_BUILD}")
+    st.caption(f"גרסת מנוע: {ENGINE_BUILD}")
+    if TOOL_BUILD.split("-v")[-1] != ENGINE_BUILD.split("-v")[-1]:
+        st.error("app.py ו-engine.py אינם מאותה גרסה. יש להעלות את שניהם.")
 
 uploaded = st.file_uploader(
     "גררי לכאן את כל הקבצים של הלקוח",
