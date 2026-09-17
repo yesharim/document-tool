@@ -14,7 +14,7 @@
     POST /sort        החבילה המלאה. זו הנקודה ש-Make משתמש בה
 """
 
-API_BUILD = "api-2026-09-17-v39"
+API_BUILD = "api-2026-09-17-v41"
 
 import base64
 import os
@@ -80,11 +80,19 @@ def _clean_docs(raw: List[str]) -> List[str]:
 
 
 def _bucket(conf: float, target, target_conf: float,
-            conf_threshold: float, match_threshold: float) -> str:
+            conf_threshold: float, match_threshold: float,
+            gaps: list = None) -> str:
     """לאיזה סל המסמך שייך. אותו סדר הכרעה כמו במסך.
 
-    ביטחון זיהוי נמוך גובר על הכל: אם לא יודעים מה המסמך, אין טעם לשייך.
+    חוסר ידוע גובר על הכל: מסמך שחסרים בו עמודים לא יעלה אוטומטית, גם אם
+    זוהה ושויך בוודאות. אחרת Make יעלה דוח חלקי לסאב-אייטם וישנה סטטוס
+    ל"בבדיקה" - והסאב-אייטם ייצא מרשימת התזכורות בזמן שהמסמך עדיין חסר.
+    אף אחד לא יידע.
+
+    ואחריו ביטחון זיהוי נמוך: אם לא יודעים מה המסמך, אין טעם לשייך.
     """
+    if gaps:
+        return "review"
     if conf < conf_threshold:
         return "review"
     if target and target_conf >= match_threshold:
@@ -130,7 +138,8 @@ def sort(req: SortRequest):
     for g in groups:
         conf = engine.group_confidence(g)
         name = engine.build_name(g)
-        bucket = _bucket(conf, g["target"], g["target_conf"], 0.7, 0.6)
+        gaps = engine.find_gaps(g)
+        bucket = _bucket(conf, g["target"], g["target_conf"], 0.7, 0.6, gaps)
         if bucket == "matched":
             covered.add(g["target"])
 
@@ -144,7 +153,7 @@ def sort(req: SortRequest):
             target_conf=g["target_conf"],
             confidence=round(conf, 2),
             bucket=bucket,
-            gaps=engine.find_gaps(g),
+            gaps=gaps,
             source_files=[m["filename"] for m in members],
             pdf_b64=base64.b64encode(pdf).decode("utf-8"),
         ))

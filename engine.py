@@ -16,7 +16,7 @@
     - מה שאין לו יעד ברור -> בדיקה ידנית עם שם נכון, בלי ניחוש
 """
 
-ENGINE_BUILD = "engine-2026-09-17-v39"
+ENGINE_BUILD = "engine-2026-09-17-v41"
 
 import re
 import unicodedata
@@ -362,6 +362,30 @@ def _balances_chain(a: dict, b: dict) -> bool:
         return False
 
 
+def _chains_to(orphan: dict, members: list) -> bool:
+    """האם העמוד היתום ממשיך אחד מעמודי הסדרה, או נמשך על ידו.
+
+    שתי ראיות, מהחזקה לחלשה:
+      יתרות - יתרת הסגירה של האחד היא יתרת הפתיחה של השני
+      תאריכים - סוף התקופה של האחד סמוך לתחילת התקופה של השני
+
+    אלה ראיות טובות יותר ממספור, כי מספור בעמוד מצולם נחתך לעתים קרובות.
+    """
+    o = orphan["a"]
+    for m in members:
+        a = m["a"]
+        if _balances_chain(a, o) or _balances_chain(o, a):
+            return True
+    for m in members:
+        a = m["a"]
+        for x, y in ((a, o), (o, a)):
+            end, start = str(x.get("date_end") or ""), str(y.get("date_start") or "")
+            if len(end) == 10 and len(start) == 10 and \
+                    0 <= _days_between(end, start) <= GAP_TOLERANCE_DAYS:
+                return True
+    return False
+
+
 def _absorb_orphans(series: list, enriched: list, taken: set) -> None:
     """מצרף לסדרה קובץ שלא נקרא לו מספור, כשברור לאיזו סדרה הוא שייך.
 
@@ -372,24 +396,39 @@ def _absorb_orphans(series: list, enriched: list, taken: set) -> None:
     orphans = [e for e in enriched
                if e["index"] not in taken
                and not isinstance(e["a"].get("page_num"), int)]
-    for members in series:
-        total = members[0]["a"]["page_total"]
-        have = {m["a"]["page_num"] for m in members}
-        missing = [n for n in range(1, total + 1) if n not in have]
-        if len(missing) != 1:
+
+    for o in orphans:
+        if o["index"] in taken:
             continue
-        cat = _series_category(members)
-        fits = [o for o in orphans
-                if o["index"] not in taken
-                and o["a"]["_cat"] in (cat, "other")]
+        # לאיזו סדרה הוא מתאים. שתי דרכים: רצף יתרות או תאריכים, או -
+        # כשאין נתונים כאלה - חסר בדיוק מספר אחד בסדרה.
+        fits = []
+        for members in series:
+            cat = _series_category(members)
+            if o["a"]["_cat"] not in (cat, "other"):
+                continue
+            total = members[0]["a"]["page_total"]
+            have = {m["a"]["page_num"] for m in members
+                    if isinstance(m["a"].get("page_num"), int)}
+            missing = [n for n in range(1, total + 1) if n not in have]
+            if _chains_to(o, members):
+                fits.append((members, missing))
+            elif len(missing) == 1:
+                fits.append((members, missing))
         if len(fits) != 1:
-            continue                     # יותר מאפשרות אחת - לא מנחשים
-        o = fits[0]
-        o["a"]["page_num"] = missing[0]
-        o["a"]["page_total"] = total
+            continue                     # לא מתאים לאף אחת, או ליותר מאחת
+
+        members, missing = fits[0]
+        # מספר עמוד נקבע רק כשהוא חד-משמעי. אחרת הקובץ מצטרף בלי מספר,
+        # ודיווח החוסר ימשיך לציין שעמוד כלשהו עדיין נעדר.
+        if len(missing) == 1:
+            o["a"]["page_num"] = missing[0]
+            o["a"]["page_total"] = members[0]["a"]["page_total"]
         members.append(o)
         taken.add(o["index"])
-        members.sort(key=lambda m: m["a"]["page_num"])
+        members.sort(key=lambda m: (
+            m["a"]["page_num"] if isinstance(m["a"].get("page_num"), int) else 99,
+            str(m["a"].get("date_start") or "")))
 
 
 def _series_category(members: list) -> str:

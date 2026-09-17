@@ -79,7 +79,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-TOOL_BUILD = "sorter-2026-09-17-v39"         # גרסת כלי המיון (נפרד מ-BUILD של המנוע)
+TOOL_BUILD = "sorter-2026-09-17-v41"         # גרסת כלי המיון (נפרד מ-BUILD של המנוע)
 
 CHEAP_MODEL = "claude-haiku-4-5-20251001"   # דגם זול לקריאה
 PRECISE_MODEL = "claude-sonnet-5"           # דגם מדויק לשדרוג ולקיבוץ
@@ -1083,9 +1083,14 @@ if run:
             if target and tconf < match_threshold:
                 target = None
 
-            # סדר ההכרעה: ביטחון זיהוי נמוך גובר על הכל, כי אם לא יודעים מה
-            # המסמך – אין טעם לשייך אותו. אחר כך היעד, ולבסוף מסמכים נוספים.
-            if conf < threshold:
+            # סדר ההכרעה: חוסר ידוע גובר על הכל. מסמך שחסרים בו עמודים לא
+            # ייחשב מוכן להעלאה, גם אם זוהה ושויך בוודאות - אחרת הוא יעלה
+            # לסאב-אייטם, הסטטוס ישתנה, והסאב-אייטם ייצא מרשימת התזכורות
+            # בזמן שהמסמך עדיין חלקי.
+            # אחריו ביטחון זיהוי נמוך: אם לא יודעים מה המסמך, אין טעם לשייך.
+            if g.get("gaps"):
+                bucket, folder = "review", "לבדיקה/"
+            elif conf < threshold:
                 bucket, folder = "review", "לבדיקה/"
             elif target:
                 bucket, folder = "ok", safe_filename(target) + "/"
@@ -1094,6 +1099,7 @@ if run:
 
             zf.writestr(folder + fname, pdf)
             entry = {"name": fname, "pdf": pdf, "conf": conf, "note": g.get("note", ""),
+                     "gaps": g.get("gaps") or [],
                      "target": target, "tconf": tconf,
                      "sources": [m["filename"] for m in members], "key": f"g{gi}"}
             {"ok": ok_groups, "review": review_groups, "extra": extra_groups}[bucket].append(entry)
@@ -1149,6 +1155,8 @@ if R:
         cols = st.columns([3, 1])
         with cols[0]:
             st.markdown(f"**{entry['name']}**")
+            for t in entry.get("gaps") or []:
+                st.warning(f"⚠ {t}")
             if entry.get("target"):
                 st.caption(f"↖ לסאב-אייטם: {entry['target']}  ·  ביטחון שיוך "
                            f"{round(entry.get('tconf', 0), 2)}")
@@ -1170,7 +1178,9 @@ if R:
         for e in R["extra"]:
             show(e)
     if R["review"]:
-        st.subheader("⚠️ לבדיקה ידנית (ביטחון זיהוי נמוך)")
+        st.subheader("⚠️ לבדיקה ידנית")
+        st.caption("ביטחון זיהוי נמוך, או שזוהה חוסר במסמך — למשל עמוד "
+                   "שלא הגיע. מסמך חלקי לא יעלה אוטומטית.")
         for e in R["review"]:
             show(e)
 

@@ -11,7 +11,7 @@
     ב-engine.py.
 """
 
-READER_BUILD = "reader-2026-09-17-v39"
+READER_BUILD = "reader-2026-09-17-v41"
 
 import io
 import re
