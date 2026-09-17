@@ -41,7 +41,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-TOOL_BUILD = "sorter-2026-09-16-v23"         # גרסת כלי המיון (נפרד מ-BUILD של המנוע)
+TOOL_BUILD = "sorter-2026-09-16-v24"         # גרסת כלי המיון (נפרד מ-BUILD של המנוע)
 
 CHEAP_MODEL = "claude-haiku-4-5-20251001"   # דגם זול לקריאה
 PRECISE_MODEL = "claude-sonnet-5"           # דגם מדויק לשדרוג ולקיבוץ
@@ -531,6 +531,12 @@ def analyze_one(client: Anthropic, model: str, name: str, data: bytes,
         for k in FIELDS:
             if parsed.get(k) is not None:
                 result[k] = parsed[k]
+        # מספר עמוד חסר היגיון (למשל 332 בלי page_total) הוא לרוב מספר שנקלט
+        # בטעות מתוך המסמך - מספר חשבון או אסמכתא. עדיף בלי מאשר שגוי, כי
+        # שלב הקיבוץ מסתמך עליו.
+        pn, pt = result.get("page_num"), result.get("page_total")
+        if isinstance(pn, int) and pn > 50 and not isinstance(pt, int):
+            result["page_num"] = None
     except Exception as e:
         # חושפים את הסיבה במקום להבליע: בלי זה הקובץ יוצא "אחר / 0.0" בלי הסבר,
         # וזו בדיוק הסיטואציה שקשה לאבחן בה מה קרה.
@@ -604,18 +610,15 @@ def _targeting_prompt(case_docs: list) -> str:
     )
 
 
-# צורות הקריאה לפי סדר עדיפות. גרסאות שונות של ספריית Anthropic מקבלות
-# פרמטרים שונים, וסטרימליט מושכת את הגרסה שיש ברגע הפריסה. במקום להניח,
-# מנסים מהטובה ביותר לפשוטה ביותר ועוצרים בראשונה שעובדת.
-#   temperature=0  -> תשובה קבועה לאותו קלט. קריטי למשימת חילוץ.
-#   thinking off   -> חוסך טוקני חשיבה, ומונע מצב שהחשיבה בולעת את כל התשובה.
+# צורות הקריאה לפי סדר עדיפות. גרסאות שונות של הספרייה ושל המודל מקבלות
+# פרמטרים שונים, וסטרימליט מושכת את הגרסה שיש ברגע הפריסה.
+#
+# הערה חשובה: temperature אינו ברשימה בכוונה. הוא היה הדרך לקבל תשובה קבועה
+# לאותו קלט, אבל השרת מחזיר עליו במפורש "deprecated for this model" - הוא
+# בוטל ואי אפשר להגדיר אותו. אין מה לנסות.
+# מה שכן נשאר: כיבוי החשיבה הפנימית, שחוסך טוקני פלט ומונע מצב שהחשיבה
+# בולעת את כל תקרת האורך והתשובה חוזרת ריקה.
 _CALL_VARIANTS = [
-    {"temperature": 0, "thinking": {"type": "disabled"}},
-    {"temperature": 0.0, "thinking": {"type": "disabled"}},
-    {"thinking": {"type": "disabled"}, "extra_body": {"temperature": 0}},
-    {"temperature": 0},
-    {"temperature": 0.0},
-    {"extra_body": {"temperature": 0}},
     {"thinking": {"type": "disabled"}},
     {},
 ]
@@ -914,16 +917,12 @@ def render_cost_panel(prices: dict, slot=None) -> None:
 
     cv = st.session_state.get("call_variant_desc")
     if cv:
-        if "temperature" in cv:
-            box.success(f"מצב קריאה: {cv} — תשובות יציבות בין הרצות")
-        else:
-            box.warning(f"מצב קריאה: {cv} — בלי temperature. התשובות עלולות "
-                        "להשתנות בין הרצות על אותם קבצים.")
-            rej = st.session_state.get("call_rejections") or []
-            if rej:
-                with box.expander("🔍 למה temperature נדחה (לאבחון)"):
-                    for r in rej:
-                        st.code(r)
+        box.caption(f"מצב קריאה מול השרת: {cv}")
+    rej = st.session_state.get("call_rejections") or []
+    if rej:
+        with box.expander("🔍 פרמטרים שנדחו (לאבחון)"):
+            for r in rej:
+                st.code(r)
     if box.button("אפס מונה עלות"):
         st.session_state["usage"] = {}
         st.rerun()
