@@ -16,7 +16,7 @@
     - מה שאין לו יעד ברור -> בדיקה ידנית עם שם נכון, בלי ניחוש
 """
 
-ENGINE_BUILD = "engine-2026-09-17-v35"
+ENGINE_BUILD = "engine-2026-09-17-v37"
 
 import re
 import unicodedata
@@ -308,6 +308,121 @@ def group_key(a: dict) -> tuple:
     return tuple(parts)
 
 
+def _page_series(enriched: list) -> list:
+    """מאתר סדרות עמודים: כמה קבצים שהם עמודים של אותו מסמך.
+
+    למה זה קריטי: לקוחות שולחים דוח עו״ש כצילומים, עמוד-עמוד. רק העמוד
+    הראשון נושא כותרת עם שם הלקוח, הבנק ומספר החשבון - וכל השאר טבלת
+    תנועות בלבד. הקיבוץ הרגיל מזהה מסמך לפי בדיוק השדות האלה, ולכן פירק
+    מסמך אחד לארבעה.
+
+    המספור המודפס ('דף 3 מתוך 5') הוא הסימן החזק ביותר שיש, והוא נקרא
+    אמין. כאן משתמשים בו.
+
+    תנאי בטיחות: המספרים חייבים להיות ייחודיים. אם הועלו שני מסמכים שונים
+    שבשניהם יש 'עמוד 1 מתוך 5', המספרים יתנגשו - ואז לא מאחדים, אלא
+    נופלים חזרה לקיבוץ הרגיל. עדיף לא לאחד מאשר לאחד שני מסמכים זרים.
+    """
+    by_total = {}
+    for e in enriched:
+        pn, pt = e["a"].get("page_num"), e["a"].get("page_total")
+        if isinstance(pn, int) and isinstance(pt, int) and pt > 1:
+            by_total.setdefault(pt, []).append(e)
+
+    series = []
+    for total, members in by_total.items():
+        if len(members) < 2:
+            continue
+        nums = [m["a"]["page_num"] for m in members]
+        if len(set(nums)) != len(nums):
+            continue                      # מספרים חוזרים - כנראה שני מסמכים
+        if any(n < 1 or n > total for n in nums):
+            continue
+        # זהות תואמת: מי שיש לו שם חייב להסכים עם האחרים שיש להם שם
+        peoples = [m["a"]["_people"] for m in members if m["a"]["_people"]]
+        if peoples and not set.intersection(*(set(p) for p in peoples)):
+            continue
+        # במכוון אין כאן בדיקת מנפיק: עמוד אמצעי אינו נושא לוגו, והמודל
+        # נוטה להשלים שם בנק מהניחוש. פסילה לפיו הייתה הורסת בדיוק את
+        # הסדרות שהמנגנון הזה נועד לאחד. ההגנה היא מספור העמודים -
+        # מספרים חוזרים כבר נפסלו למעלה.
+        members.sort(key=lambda m: m["a"]["page_num"])
+        series.append(members)
+    return series
+
+
+def _balances_chain(a: dict, b: dict) -> bool:
+    """האם יתרת הסגירה של עמוד אחד שווה ליתרת הפתיחה של הבא."""
+    e, s = a.get("balance_end"), b.get("balance_start")
+    if e is None or s is None:
+        return False
+    try:
+        return abs(float(e) - float(s)) < 0.01
+    except (TypeError, ValueError):
+        return False
+
+
+def _absorb_orphans(series: list, enriched: list, taken: set) -> None:
+    """מצרף לסדרה קובץ שלא נקרא לו מספור, כשברור לאיזו סדרה הוא שייך.
+
+    לקוח מצלם עמוד-עמוד, ולעתים המספור בעמוד אחד מטושטש. אם בסדרה חסר
+    בדיוק מספר אחד, ונשאר בדיוק קובץ יתום אחד מאותה קטגוריה - הוא העמוד
+    החסר. אם יש יותר מאפשרות אחת, לא מנחשים.
+    """
+    orphans = [e for e in enriched
+               if e["index"] not in taken
+               and not isinstance(e["a"].get("page_num"), int)]
+    for members in series:
+        total = members[0]["a"]["page_total"]
+        have = {m["a"]["page_num"] for m in members}
+        missing = [n for n in range(1, total + 1) if n not in have]
+        if len(missing) != 1:
+            continue
+        cat = _series_category(members)
+        fits = [o for o in orphans
+                if o["index"] not in taken
+                and o["a"]["_cat"] in (cat, "other")]
+        if len(fits) != 1:
+            continue                     # יותר מאפשרות אחת - לא מנחשים
+        o = fits[0]
+        o["a"]["page_num"] = missing[0]
+        o["a"]["page_total"] = total
+        members.append(o)
+        taken.add(o["index"])
+        members.sort(key=lambda m: m["a"]["page_num"])
+
+
+def _series_category(members: list) -> str:
+    """קטגוריית הסדרה: לפי העמוד הראשון, שהוא היחיד שנושא כותרת מלאה.
+
+    עמוד אמצעי או אחרון מסווג לעתים אחרת - עמוד אחרון של דוח תנועות נראה
+    כאישור בנקאי - ולכן העמוד הראשון קובע.
+    """
+    for m in members:
+        if m["a"]["_cat"] != "other":
+            return m["a"]["_cat"]
+    return "other"
+
+
+def _adopt_series_identity(members: list) -> None:
+    """בסדרת עמודים, הזהות נלקחת מהעמוד הראשון שיש לו אותה.
+
+    עמוד אמצעי של דוח תנועות אינו נושא לוגו או כותרת, והמודל נוטה להשלים
+    שם בנק מהניחוש. כאן מוחקים את מה שהומצא ומאמצים את מה שנקרא מהעמוד
+    שבאמת מכיל את הכותרת.
+    """
+    for field in ("person_name", "source", "branch", "account_last3"):
+        val = next((m["a"].get(field) for m in members if m["a"].get(field)), None)
+        if val is None:
+            continue
+        for m in members:
+            m["a"][field] = val
+    people = next((m["a"]["_people"] for m in members if m["a"]["_people"]),
+                  frozenset())
+    for m in members:
+        m["a"]["_people"] = people
+
+
 def build_groups(per_file: list) -> list:
     """מקבץ קבצים למסמכים לוגיים. פונקציה טהורה - אין בה קריאה למודל."""
     enriched = []
@@ -318,15 +433,31 @@ def build_groups(per_file: list) -> list:
         enriched.append({"index": i, "filename": f.get("filename", ""),
                          "a": a, "file_pages": f.get("file_pages", 1)})
 
+    # קודם סדרות עמודים. מה שנקלט בהן יוצא מהמסלול הרגיל.
+    groups, taken = [], set()
+    series = _page_series(enriched)
+    for members in series:
+        for m in members:
+            taken.add(m["index"])
+    _absorb_orphans(series, enriched, taken)
+    for members in series:
+        cat = _series_category(members)
+        _adopt_series_identity(members)
+        for m in members:
+            m["a"]["_cat"] = cat          # כל עמודי הסדרה מקבלים קטגוריה אחת
+        groups.append({"key": ("series", cat, members[0]["index"]),
+                       "cat": cat, "members": members})
+
     buckets = {}
     for e in enriched:
+        if e["index"] in taken:
+            continue
         # קובץ בלי קטגוריה מזוהה נשאר תמיד בודד: אין כלל שמתיר לאחד אותו,
         # ולכן הוא ילך לבדיקה ידנית עם השם שחולץ ממנו.
         key = (("other", e["index"]) if e["a"]["_cat"] == "other"
                else group_key(e["a"]))
         buckets.setdefault(key, []).append(e)
 
-    groups = []
     for key, members in buckets.items():
         for cluster in split_by_source(members):
             cluster.sort(key=lambda m: (min(_months(m["a"]) or {0}), m["index"]))
@@ -404,6 +535,50 @@ def _acct_label(members: list) -> str:
     if ac:
         return f"[{ac}]"
     return ""
+
+
+def find_gaps(group: dict) -> list:
+    """מאתר חוסרים במסמך תקופתי. מחזיר רשימת תיאורים בעברית.
+
+    שלוש בדיקות, מהחזקה לחלשה:
+      1. מספור עמודים - 'דף 3 מתוך 4' שלא הגיע
+      2. רצף יתרות - יתרת הסגירה של עמוד אינה יתרת הפתיחה של הבא
+      3. רצף תאריכים - פער בין סוף עמוד לתחילת הבא
+
+    הבחנה חשובה: פער בתאריכים לבדו אינו בהכרח חוסר. ייתכן שלא היו תנועות
+    באותה תקופה. אבל אם גם היתרות אינן מתחברות - חסר דף.
+    """
+    members = group["members"]
+    if len(members) < 1 or group["cat"] not in ("bank_statement",
+                                                "mortgage_history"):
+        return []
+
+    gaps = []
+    total = next((m["a"].get("page_total") for m in members
+                  if isinstance(m["a"].get("page_total"), int)), None)
+    have = {m["a"].get("page_num") for m in members
+            if isinstance(m["a"].get("page_num"), int)}
+    if total and have:
+        missing = [n for n in range(1, total + 1) if n not in have]
+        if missing:
+            gaps.append("חסרים עמודים " +
+                        ", ".join(str(n) for n in missing) + f" מתוך {total}")
+
+    ordered = sorted(members, key=lambda m: (
+        m["a"].get("page_num") if isinstance(m["a"].get("page_num"), int) else 99,
+        str(m["a"].get("date_start") or "")))
+    for a, b in zip(ordered, ordered[1:]):
+        da, db = a["a"], b["a"]
+        end, start = str(da.get("date_end") or ""), str(db.get("date_start") or "")
+        if not (len(end) == 10 and len(start) == 10) or start <= end:
+            continue
+        chained = _balances_chain(da, db)
+        if chained:
+            continue                # היתרות מתחברות - פשוט לא היו תנועות
+        gaps.append(f"פער בתאריכים בין {end} ל-{start}" +
+                    ("" if da.get("balance_end") is None
+                     else " והיתרות אינן מתחברות"))
+    return gaps
 
 
 def group_confidence(group: dict) -> float:

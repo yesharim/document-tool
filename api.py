@@ -14,7 +14,7 @@
     POST /sort        החבילה המלאה. זו הנקודה ש-Make משתמש בה
 """
 
-API_BUILD = "api-2026-09-17-v35"
+API_BUILD = "api-2026-09-17-v37"
 
 import base64
 import os
@@ -54,6 +54,7 @@ class OutDoc(BaseModel):
     target_conf: float
     confidence: float
     bucket: str                 # matched / extra / review
+    gaps: List[str] = Field(default_factory=list)
     source_files: List[str]
     pdf_b64: str
 
@@ -143,6 +144,7 @@ def sort(req: SortRequest):
             target_conf=g["target_conf"],
             confidence=round(conf, 2),
             bucket=bucket,
+            gaps=engine.find_gaps(g),
             source_files=[m["filename"] for m in members],
             pdf_b64=base64.b64encode(pdf).decode("utf-8"),
         ))

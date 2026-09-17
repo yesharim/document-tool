@@ -45,7 +45,7 @@ except Exception:
 # אם הקובץ שבמאגר ישן מהאפליקציה, נעדיף הודעה ברורה בעברית על פני קריסה.
 try:
     from engine import (build_groups, assign, build_name, group_confidence,
-                        CATEGORIES, ENGINE_BUILD)
+                        find_gaps, CATEGORIES, ENGINE_BUILD)
     _ENGINE_ERR = None
 except ImportError as _e:
     _ENGINE_ERR = str(_e)
@@ -79,7 +79,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-TOOL_BUILD = "sorter-2026-09-17-v35"         # גרסת כלי המיון (נפרד מ-BUILD של המנוע)
+TOOL_BUILD = "sorter-2026-09-17-v37"         # גרסת כלי המיון (נפרד מ-BUILD של המנוע)
 
 CHEAP_MODEL = "claude-haiku-4-5-20251001"   # דגם זול לקריאה
 PRECISE_MODEL = "claude-sonnet-5"           # דגם מדויק לשדרוג ולקיבוץ
@@ -1044,7 +1044,9 @@ if run:
             "final_name": build_name(g),
             "confidence": group_confidence(g),
             "target": g["target"], "target_conf": g["target_conf"],
-            "note": g.get("target_reason", ""),
+            "note": " · ".join(filter(None, [g.get("target_reason", ""),
+                                             " ; ".join(find_gaps(g))])),
+            "gaps": find_gaps(g),
         })
     if group_err:
         st.error(f"⚠️ {group_err}")

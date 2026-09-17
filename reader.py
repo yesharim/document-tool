@@ -11,7 +11,7 @@
     ב-engine.py.
 """
 
-READER_BUILD = "reader-2026-09-17-v35"
+READER_BUILD = "reader-2026-09-17-v37"
 
 import io
 import re
@@ -642,4 +642,3 @@ def _needs_source(a: dict) -> bool:
         return False
     dt = (a.get("doc_type") or "")
     return any(h in dt for h in _SOURCE_HINTS)
-
