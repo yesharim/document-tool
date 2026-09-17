@@ -29,8 +29,8 @@ import streamlit as st
 from anthropic import Anthropic
 
 # מנוע הקיבוץ, השיוך ומתן-השמות. קוד דטרמיניסטי, מכוסה בבדיקות ב-test_engine.py
-from engine import (build_groups, assign, build_name, CATEGORIES,
-                    ENGINE_BUILD)
+from engine import (build_groups, assign, build_name, group_confidence,
+                    CATEGORIES, ENGINE_BUILD)
 
 # ------------------------------------------------------------------ הגדרות בסיס
 st.set_page_config(page_title="מיון וקיבוץ מסמכים", page_icon="🗂️", layout="wide")
@@ -46,7 +46,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-TOOL_BUILD = "sorter-2026-09-17-v32"         # גרסת כלי המיון (נפרד מ-BUILD של המנוע)
+TOOL_BUILD = "sorter-2026-09-17-v33"         # גרסת כלי המיון (נפרד מ-BUILD של המנוע)
 
 CHEAP_MODEL = "claude-haiku-4-5-20251001"   # דגם זול לקריאה
 PRECISE_MODEL = "claude-sonnet-5"           # דגם מדויק לשדרוג ולקיבוץ
@@ -994,12 +994,11 @@ if run:
     assign(eng_groups, case_docs)
     groups, group_err = [], None
     for g in eng_groups:
-        conf = [float(m["a"].get("confidence") or 0) for m in g["members"]]
         groups.append({
             "indices": [m["index"] for m in g["members"]],
             "doc_type": g["members"][0]["a"].get("doc_type", ""),
             "final_name": build_name(g),
-            "confidence": min(conf) if conf else 0.0,
+            "confidence": group_confidence(g),
             "target": g["target"], "target_conf": g["target_conf"],
             "note": g.get("target_reason", ""),
         })

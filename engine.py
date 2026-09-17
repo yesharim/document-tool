@@ -16,7 +16,7 @@
     - מה שאין לו יעד ברור -> בדיקה ידנית עם שם נכון, בלי ניחוש
 """
 
-ENGINE_BUILD = "engine-2026-09-17-v32"
+ENGINE_BUILD = "engine-2026-09-17-v33"
 
 import re
 import unicodedata
@@ -404,6 +404,20 @@ def _acct_label(members: list) -> str:
     if ac:
         return f"[{ac}]"
     return ""
+
+
+def group_confidence(group: dict) -> float:
+    """ביטחון הזיהוי של הקבוצה כולה.
+
+    לא המינימום: קריאה חלשה אחת מתוך חמש גררה קבוצה נכונה לגמרי לבדיקה
+    ידנית. כשכמה קבצים נקראו בנפרד והגיעו לאותו סיווג, ההסכמה ביניהם
+    מחזקת ולא מחלישה. לכן חציון, שעמיד לחריג בודד.
+    """
+    vals = sorted(float(m["a"].get("confidence") or 0) for m in group["members"])
+    if not vals:
+        return 0.0
+    n = len(vals)
+    return vals[n // 2] if n % 2 else (vals[n // 2 - 1] + vals[n // 2]) / 2
 
 
 def build_name(group: dict) -> str:
