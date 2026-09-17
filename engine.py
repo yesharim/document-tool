@@ -16,7 +16,7 @@
     - מה שאין לו יעד ברור -> בדיקה ידנית עם שם נכון, בלי ניחוש
 """
 
-ENGINE_BUILD = "engine-2026-09-17-v37"
+ENGINE_BUILD = "engine-2026-09-17-v38"
 
 import re
 import unicodedata
@@ -537,6 +537,18 @@ def _acct_label(members: list) -> str:
     return ""
 
 
+# פער קצר בין סוף עמוד לתחילת הבא הוא המשך טבעי, לא חוסר. דוחות רבים
+# מסתיימים ביום אחד ומתחילים למחרת.
+GAP_TOLERANCE_DAYS = 3
+
+
+def _days_between(a: str, b: str) -> int:
+    try:
+        return abs((date.fromisoformat(b) - date.fromisoformat(a)).days)
+    except Exception:
+        return 0
+
+
 def find_gaps(group: dict) -> list:
     """מאתר חוסרים במסמך תקופתי. מחזיר רשימת תיאורים בעברית.
 
@@ -572,12 +584,15 @@ def find_gaps(group: dict) -> list:
         end, start = str(da.get("date_end") or ""), str(db.get("date_start") or "")
         if not (len(end) == 10 and len(start) == 10) or start <= end:
             continue
-        chained = _balances_chain(da, db)
-        if chained:
+        if _days_between(end, start) <= GAP_TOLERANCE_DAYS:
+            continue                # המשך טבעי בין עמודים, לא חוסר
+        if _balances_chain(da, db):
             continue                # היתרות מתחברות - פשוט לא היו תנועות
+        # מדווחים על היתרות רק כששתיהן באמת נקראו. עמוד אמצעי מצולם לא
+        # תמיד מוסר אותן, ואי-קריאה אינה ראיה לחוסר.
+        both = da.get("balance_end") is not None and db.get("balance_start") is not None
         gaps.append(f"פער בתאריכים בין {end} ל-{start}" +
-                    ("" if da.get("balance_end") is None
-                     else " והיתרות אינן מתחברות"))
+                    (" והיתרות אינן מתחברות" if both else ""))
     return gaps
 
 
@@ -588,9 +603,23 @@ def group_confidence(group: dict) -> float:
     ידנית. כשכמה קבצים נקראו בנפרד והגיעו לאותו סיווג, ההסכמה ביניהם
     מחזקת ולא מחלישה. לכן חציון, שעמיד לחריג בודד.
     """
-    vals = sorted(float(m["a"].get("confidence") or 0) for m in group["members"])
+    members = group["members"]
+    vals = sorted(float(m["a"].get("confidence") or 0) for m in members)
     if not vals:
         return 0.0
+
+    # סדרת עמודים שלמה: הביטחון נקבע לפי העמוד החזק ביותר, לרוב עמוד
+    # הכותרת. עמוד אמצעי של דוח תנועות אינו נושא מידע מזהה ולכן מדווח
+    # ביטחון נמוך - אבל המספור הרצוף מוכיח שהוא חלק מאותו מסמך, וזו
+    # ראיה חזקה יותר מהביטחון של כל עמוד בנפרד.
+    nums = [m["a"].get("page_num") for m in members]
+    total = next((m["a"].get("page_total") for m in members
+                  if isinstance(m["a"].get("page_total"), int)), None)
+    if (total and len(members) == total
+            and all(isinstance(n, int) for n in nums)
+            and sorted(nums) == list(range(1, total + 1))):
+        return max(vals)
+
     n = len(vals)
     return vals[n // 2] if n % 2 else (vals[n // 2 - 1] + vals[n // 2]) / 2
 
