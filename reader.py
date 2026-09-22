@@ -11,7 +11,7 @@
     ב-engine.py.
 """
 
-READER_BUILD = "reader-2026-09-17-v41"
+READER_BUILD = "reader-2026-09-22-v44"
 
 import io
 import re
@@ -31,11 +31,17 @@ from anthropic import Anthropic
 _STATE = {}
 _USAGE = {}
 
+# הקבצים נקראים במקביל, ושני המונים האלה משותפים לכל הקריאות. בלי נעילה,
+# שתי קריאות שמסתיימות באותו רגע עלולות לדרוס זו את ספירת הטוקנים של זו.
+import threading
+_LOCK = threading.Lock()
+
 
 def usage_snapshot() -> dict:
     """מחזיר את צריכת הטוקנים שנצברה, ומאפס."""
-    out = {k: dict(v) for k, v in _USAGE.items()}
-    _USAGE.clear()
+    with _LOCK:
+        out = {k: dict(v) for k, v in _USAGE.items()}
+        _USAGE.clear()
     return out
 
 
@@ -43,10 +49,11 @@ def _track_usage(model: str, resp) -> None:
     u = getattr(resp, "usage", None)
     if u is None:
         return
-    d = _USAGE.setdefault(model, {"in": 0, "out": 0, "calls": 0})
-    d["in"] += getattr(u, "input_tokens", 0) or 0
-    d["out"] += getattr(u, "output_tokens", 0) or 0
-    d["calls"] += 1
+    with _LOCK:
+        d = _USAGE.setdefault(model, {"in": 0, "out": 0, "calls": 0})
+        d["in"] += getattr(u, "input_tokens", 0) or 0
+        d["out"] += getattr(u, "output_tokens", 0) or 0
+        d["calls"] += 1
 
 
 def read_file(client: Anthropic, name: str, data: bytes,

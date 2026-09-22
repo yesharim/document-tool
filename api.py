@@ -14,7 +14,7 @@
     POST /sort        החבילה המלאה. זו הנקודה ש-Make משתמש בה
 """
 
-API_BUILD = "api-2026-09-22-v43"
+API_BUILD = "api-2026-09-22-v44"
 
 import base64
 import os
@@ -115,7 +115,8 @@ def _clean_docs(raw: List[str]) -> List[str]:
 # הסטטוסים שמותר להעלות אליהם מסמך חדש. "תקין" חסום: הנציג כבר אישר,
 # ומסמך נוסף שם היה יוצר בלבול במה שכבר נסגר. "בבדיקה" פתוח: לקוח שולח
 # בטפטופים, ותלוש שני צריך להגיע לאותו סאב-אייטם שקיבל את הראשון.
-ALLOWED_STATUSES = {"נדרש מהלקוח", "בבדיקה"}
+REQUIRED_STATUS = "נדרש מהלקוח"
+ALLOWED_STATUSES = {REQUIRED_STATUS, "בבדיקה"}
 EXTRAS_NAME = "מסמכים נוספים"
 
 
@@ -127,19 +128,26 @@ def plan_subitems(subitems: List[InSubitem]) -> dict:
                  שני סאב-אייטמים באותו שם; במקרה כזה לא מנחשים
     extras_id  - המזהה של "מסמכים נוספים", לאן הולך כל מה שלא שויך
     """
-    targets, name_to_ids, extras_id = [], {}, None
+    targets, required, name_to_ids, extras_id = [], [], {}, None
     for s in subitems:
         name = (s.name or "").strip()
         sid = str(s.id)
         if name == EXTRAS_NAME:
             extras_id = extras_id or sid
             continue
-        if s.status_text() not in ALLOWED_STATUSES:
+        status = s.status_text()
+        if status not in ALLOWED_STATUSES:
             continue
         name_to_ids.setdefault(name, []).append(sid)
         if name not in targets:
             targets.append(name)
-    return {"targets": targets, "name_to_ids": name_to_ids, "extras_id": extras_id}
+        # "בבדיקה" פתוח לשיוך, אבל המסמך שלו כבר הגיע - הוא לא חסר.
+        # רק מה שבאמת ממתין ללקוח נכנס לרשימת החסרים, כי בהמשך הרשימה הזו
+        # תשמש להודעה ללקוח על מה שעוד צריך לשלוח.
+        if status == REQUIRED_STATUS and name not in required:
+            required.append(name)
+    return {"targets": targets, "required": required,
+            "name_to_ids": name_to_ids, "extras_id": extras_id}
 
 
 def destination(target, bucket: str, plan: dict):
@@ -154,6 +162,65 @@ def destination(target, bucket: str, plan: dict):
         if len(ids) == 1:
             return ids[0], target
     return plan["extras_id"], EXTRAS_NAME
+
+
+# כמה קבצים נקראים בו-זמנית. מספיק כדי ש-40 תמונות יסתיימו בפחות מדקה,
+# ומתחת למגבלת הקצב של שרת הבינה המלאכותית.
+PARALLEL_READS = 6
+
+# שגיאות שאין טעם לנסות שוב אחריהן. מפתח שגוי יישאר שגוי בכל ניסיון.
+_FATAL_ERRORS = ("AuthenticationError", "PermissionDeniedError", "NotFoundError")
+
+
+def _error_text(e: Exception) -> str:
+    name = type(e).__name__
+    if name == "AuthenticationError":
+        return "מפתח ה-API של Anthropic שגוי או חסר בהגדרות השרת"
+    if name == "PermissionDeniedError":
+        return "למפתח ה-API אין הרשאה לדגם"
+    if name == "NotFoundError":
+        return "הדגם לא נמצא - ייתכן ששמו השתנה"
+    if name == "RateLimitError":
+        return "חריגה ממגבלת הקצב של Anthropic"
+    if "Overloaded" in name or "529" in str(e):
+        return "שרת הבינה המלאכותית עמוס"
+    return f"{name}: {str(e)[:200]}"
+
+
+def read_all(client, files: list, case_docs: list, only_edges: bool):
+    """קורא את כל הקבצים במקביל. מחזיר (תוצאות, שגיאה_קבועה).
+
+    שלושה עקרונות:
+      סדר - התוצאות חוזרות בסדר שבו הקבצים נשלחו, כי הקיבוץ תלוי בו
+      בידוד - קובץ שנכשל לא מפיל את השאר; הוא מסומן ונשלח לבדיקה ידנית
+      עצירה - שגיאה קבועה (מפתח שגוי) עוצרת הכל מיד, בלי לבזבז קריאות
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    def one(item):
+        name, data = item
+        if not data:
+            return {"name": name, "data": data, "error": "הקובץ פגום ולא ניתן לפענוח",
+                    "fatal": False, "a": _failed_fields(name, "הקובץ פגום")}
+        try:
+            a = reader.read_file(client, name, data, case_docs, only_edges)
+            return {"name": name, "data": data, "a": a, "error": None, "fatal": False}
+        except Exception as e:
+            fatal = type(e).__name__ in _FATAL_ERRORS
+            return {"name": name, "data": data, "error": _error_text(e),
+                    "fatal": fatal, "a": _failed_fields(name, _error_text(e))}
+
+    with ThreadPoolExecutor(max_workers=PARALLEL_READS) as pool:
+        results = list(pool.map(one, files))     # map שומר על הסדר
+
+    fatal = next((r["error"] for r in results if r["fatal"]), None)
+    return results, fatal
+
+
+def _failed_fields(name: str, reason: str) -> dict:
+    """שדות לקובץ שלא נקרא. ביטחון אפס מבטיח שילך לבדיקה ידנית."""
+    return {"doc_type": "קובץ שלא נקרא", "summary": reason, "confidence": 0.0,
+            "person_name": None, "source": None}
 
 
 def _bucket(conf: float, target, target_conf: float,
@@ -204,18 +271,43 @@ def sort(req: SortRequest):
     else:
         # תאימות לאחור: רשימת שמות בלבד, בלי מזהים
         case_docs = _clean_docs(req.case_docs)
-        plan = {"targets": case_docs, "name_to_ids": {}, "extras_id": None}
+        plan = {"targets": case_docs, "required": case_docs,
+                "name_to_ids": {}, "extras_id": None}
 
-    # שלב 1 — קריאה. קובץ אחד בכל פעם, בדגם המדויק.
-    per_file = []
+    # שלב 1 — קריאה. במקביל, בדגם המדויק.
+    decoded = []
     for f in req.files:
         try:
-            data = base64.b64decode(f.content_b64)
+            decoded.append((f.name, base64.b64decode(f.content_b64)))
         except Exception:
-            raise HTTPException(400, f"קובץ פגום: {f.name}")
-        a = reader.read_file(client, f.name, data, case_docs, req.only_edges)
-        per_file.append({"filename": f.name, "bytes": data, "a": a,
-                         "file_pages": reader.file_page_count(f.name, data)})
+            # קובץ שלא ניתן לפענח לא עוצר את החבילה - הוא הולך לבדיקה ידנית
+            decoded.append((f.name, b""))
+
+    results, fatal = read_all(client, decoded, case_docs, req.only_edges)
+    if fatal:
+        # שגיאה קבועה - מפתח שגוי, הרשאה חסרה. אין טעם לנסות שוב, וכל
+        # ניסיון נוסף רק עולה כסף. קוד 422 אומר ל-Make לא לנסות שוב אוטומטית.
+        raise HTTPException(422, fatal)
+
+    failed = [r for r in results if r["error"]]
+    if decoded and len(failed) == len(decoded):
+        # כל הקבצים נכשלו בשגיאה זמנית - עומס, זמן המתנה. כאן כן כדאי לנסות
+        # שוב, ולכן 503: Make ינסה שוב בעוד כמה דקות.
+        raise HTTPException(503, "כל הקבצים נכשלו בקריאה, כנראה עומס זמני: "
+                                 + failed[0]["error"])
+
+    # קובץ שהתוכן שלו לא התקבל בכלל לא נכנס לחבילה - אין מה למזג או להעלות.
+    # קובץ שהתוכן שלו תקין אבל הקריאה נכשלה - נכנס, ויישלח לבדיקה ידנית
+    # עם התוכן המקורי, כך שהנציג יראה אותו.
+    per_file = [{"filename": r["name"], "bytes": r["data"], "a": r["a"],
+                 "file_pages": reader.file_page_count(r["name"], r["data"])}
+                for r in results if r["data"]]
+    for r in failed:
+        if r["data"]:
+            warnings.append(f'הקובץ {r["name"]} לא נקרא ונשלח לבדיקה ידנית: {r["error"]}')
+        else:
+            warnings.append(f'הקובץ {r["name"]} הגיע פגום ולא הועלה. הוא נשאר '
+                            'בשיחת הוואטסאפ של הלקוח.')
 
     # שלב 2 — קיבוץ, שיוך ומתן-שמות. בקוד, בלי מודל.
     groups = engine.build_groups(per_file)
@@ -253,7 +345,7 @@ def sort(req: SortRequest):
                "reader": reader.READER_BUILD},
         monday_case_id=req.monday_case_id,
         documents=docs,
-        still_missing=[d for d in case_docs if d not in covered],
+        still_missing=[d for d in plan["required"] if d not in covered],
         extras_subitem_id=plan["extras_id"],
         warnings=warnings,
         usage=reader.usage_snapshot(),
