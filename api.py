@@ -14,11 +14,11 @@
     POST /sort        החבילה המלאה. זו הנקודה ש-Make משתמש בה
 """
 
-API_BUILD = "api-2026-09-17-v41"
+API_BUILD = "api-2026-09-22-v43"
 
 import base64
 import os
-from typing import List, Optional
+from typing import List, Optional, Union
 
 from anthropic import Anthropic
 from fastapi import FastAPI, HTTPException
@@ -37,10 +37,37 @@ class InFile(BaseModel):
     content_b64: str
 
 
+class InColumnValue(BaseModel):
+    text: Optional[str] = None
+
+
+class InSubitem(BaseModel):
+    """סאב-אייטם כפי שהוא יוצא משאילתת ה-GraphQL ב-Make, בלי עיבוד.
+
+    Make שולח את המערך כמו שהוא, והשרת מפרק אותו. כך אין צורך בנוסחאות
+    סינון ב-Make - המקום שבו דברים נשברים בשקט.
+    """
+    id: Union[str, int]
+    name: str
+    status: Optional[str] = None
+    column_values: List[InColumnValue] = Field(default_factory=list)
+
+    def status_text(self) -> str:
+        if self.status:
+            return self.status.strip()
+        for cv in self.column_values:
+            if cv.text:
+                return cv.text.strip()
+        return ""
+
+
 class SortRequest(BaseModel):
     files: List[InFile]
-    # שמות הסאב-אייטמים הפתוחים של התיק, כפי שהם במונדיי. בלעדיהם הכלי
-    # מסווג ונותן שמות אך אינו משייך.
+    # הדרך המועדפת: כל הסאב-אייטמים של התיק, עם מזהה וסטטוס. השרת מסנן
+    # לבד מה מותר לשייך אליו, ומחזיר לכל מסמך את המזהה שאליו להעלות.
+    subitems: List[InSubitem] = Field(default_factory=list)
+    # הדרך הישנה, נשמרת לתאימות: שמות בלבד, בלי מזהים. בלעדיהם הכלי
+    # מסווג ונותן שמות אך אינו יודע לאן להעלות.
     case_docs: List[str] = Field(default_factory=list)
     # מזהה התיק, מוחזר כמות שהוא כדי ש-Make יידע לאן להעלות
     monday_case_id: Optional[str] = None
@@ -54,6 +81,10 @@ class OutDoc(BaseModel):
     target_conf: float
     confidence: float
     bucket: str                 # matched / extra / review
+    # לאן Make מעלה את הקובץ. תמיד מלא כשיש סאב-אייטם "מסמכים נוספים":
+    # מסמך משויך - לסאב-אייטם שלו; כל השאר - ל"מסמכים נוספים".
+    destination_subitem_id: Optional[str] = None
+    destination_name: Optional[str] = None
     gaps: List[str] = Field(default_factory=list)
     source_files: List[str]
     pdf_b64: str
@@ -64,6 +95,8 @@ class SortResponse(BaseModel):
     monday_case_id: Optional[str]
     documents: List[OutDoc]
     still_missing: List[str]
+    extras_subitem_id: Optional[str] = None
+    warnings: List[str] = Field(default_factory=list)
     usage: dict
 
 
@@ -77,6 +110,50 @@ def _clean_docs(raw: List[str]) -> List[str]:
         if ln:
             out.append(ln)
     return out
+
+
+# הסטטוסים שמותר להעלות אליהם מסמך חדש. "תקין" חסום: הנציג כבר אישר,
+# ומסמך נוסף שם היה יוצר בלבול במה שכבר נסגר. "בבדיקה" פתוח: לקוח שולח
+# בטפטופים, ותלוש שני צריך להגיע לאותו סאב-אייטם שקיבל את הראשון.
+ALLOWED_STATUSES = {"נדרש מהלקוח", "בבדיקה"}
+EXTRAS_NAME = "מסמכים נוספים"
+
+
+def plan_subitems(subitems: List[InSubitem]) -> dict:
+    """מפרק את רשימת הסאב-אייטמים לשלושה דברים שהשרת צריך.
+
+    targets    - שמות הסאב-אייטמים שמותר לשייך אליהם, לפי הסטטוס
+    name_to_ids- מיפוי שם -> מזהים. רשימה ולא ערך, כי בתיק ישן עלולים להיות
+                 שני סאב-אייטמים באותו שם; במקרה כזה לא מנחשים
+    extras_id  - המזהה של "מסמכים נוספים", לאן הולך כל מה שלא שויך
+    """
+    targets, name_to_ids, extras_id = [], {}, None
+    for s in subitems:
+        name = (s.name or "").strip()
+        sid = str(s.id)
+        if name == EXTRAS_NAME:
+            extras_id = extras_id or sid
+            continue
+        if s.status_text() not in ALLOWED_STATUSES:
+            continue
+        name_to_ids.setdefault(name, []).append(sid)
+        if name not in targets:
+            targets.append(name)
+    return {"targets": targets, "name_to_ids": name_to_ids, "extras_id": extras_id}
+
+
+def destination(target, bucket: str, plan: dict):
+    """לאן להעלות מסמך. מחזיר (מזהה, שם).
+
+    רק מסמך משויך הולך לסאב-אייטם שלו. כל השאר - גם "לבדיקה" וגם "מסמכים
+    נוספים" - הולכים ל"מסמכים נוספים", והנציג מכריע. ואם לשם יש שני
+    סאב-אייטמים זהים, אי אפשר לדעת לאיזה מהם התכוונו - גם זה ל"נוספים".
+    """
+    if bucket == "matched" and target:
+        ids = plan["name_to_ids"].get(target, [])
+        if len(ids) == 1:
+            return ids[0], target
+    return plan["extras_id"], EXTRAS_NAME
 
 
 def _bucket(conf: float, target, target_conf: float,
@@ -117,7 +194,17 @@ def sort(req: SortRequest):
         raise HTTPException(400, "לא התקבלו קבצים")
 
     client = Anthropic(api_key=key)
-    case_docs = _clean_docs(req.case_docs)
+    warnings = []
+    if req.subitems:
+        plan = plan_subitems(req.subitems)
+        case_docs = plan["targets"]
+        if not plan["extras_id"]:
+            warnings.append(f'בתיק אין סאב-אייטם "{EXTRAS_NAME}". מסמכים שלא '
+                            'שויכו לא יקבלו יעד להעלאה.')
+    else:
+        # תאימות לאחור: רשימת שמות בלבד, בלי מזהים
+        case_docs = _clean_docs(req.case_docs)
+        plan = {"targets": case_docs, "name_to_ids": {}, "extras_id": None}
 
     # שלב 1 — קריאה. קובץ אחד בכל פעם, בדגם המדויק.
     per_file = []
@@ -146,9 +233,12 @@ def sort(req: SortRequest):
         members = g["members"]
         pdf = reader.merge_to_pdf([per_file[m["index"]]["bytes"] for m in members],
                                   [m["filename"] for m in members])
+        dest_id, dest_name = destination(g["target"], bucket, plan)
         docs.append(OutDoc(
             name=reader.safe_filename(name) + ".pdf",
             category=g["cat"],
+            destination_subitem_id=dest_id,
+            destination_name=dest_name,
             target=g["target"] if bucket == "matched" else None,
             target_conf=g["target_conf"],
             confidence=round(conf, 2),
@@ -164,5 +254,7 @@ def sort(req: SortRequest):
         monday_case_id=req.monday_case_id,
         documents=docs,
         still_missing=[d for d in case_docs if d not in covered],
+        extras_subitem_id=plan["extras_id"],
+        warnings=warnings,
         usage=reader.usage_snapshot(),
     )
