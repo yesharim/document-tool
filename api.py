@@ -14,14 +14,14 @@
     POST /sort        החבילה המלאה. זו הנקודה ש-Make משתמש בה
 """
 
-API_BUILD = "api-2026-09-22-v44"
+API_BUILD = "api-2026-09-22-v45"
 
 import base64
 import os
 from typing import List, Optional, Union
 
 from anthropic import Anthropic
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel, Field
 
 import engine
@@ -33,8 +33,34 @@ app = FastAPI(title="כלי מיון מסמכים", version=API_BUILD)
 # ------------------------------------------------------------------ מבנה הבקשה
 
 class InFile(BaseModel):
+    """קובץ נכנס: או התוכן עצמו, או כתובת שהשרת יוריד ממנה.
+
+    כתובת עדיפה: Make לא צריך להוריד, להמיר ולאסוף כל קובץ - שתי פעולות
+    לכל קובץ שנחסכות. השרת מוריד במקביל, בחינם.
+    """
     name: str
-    content_b64: str
+    content_b64: Optional[str] = None
+    url: Optional[str] = None
+
+
+class InAsset(BaseModel):
+    """קובץ כפי שהוא יוצא משאילתת ה-GraphQL במונדיי."""
+    id: Optional[Union[str, int]] = None
+    name: str
+    public_url: str
+    created_at: Optional[str] = None
+
+
+class InItem(BaseModel):
+    """התיק כולו, כפי שהשאילתה במודול 3 מחזירה אותו.
+
+    Make שולח את זה כמו שזה, בהמרה אחת. השרת שולף ממנו גם את הקבצים וגם
+    את הסאב-אייטמים - ומייתר שישה מודולים ב-Make.
+    """
+    id: Optional[Union[str, int]] = None
+    name: Optional[str] = None
+    assets: List[InAsset] = Field(default_factory=list)
+    subitems: List["InSubitem"] = Field(default_factory=list)
 
 
 class InColumnValue(BaseModel):
@@ -61,8 +87,13 @@ class InSubitem(BaseModel):
         return ""
 
 
+InItem.model_rebuild()
+
+
 class SortRequest(BaseModel):
-    files: List[InFile]
+    # הדרך החסכונית: התיק כולו מהשאילתה. גובר על files ו-subitems.
+    item: Optional[InItem] = None
+    files: List[InFile] = Field(default_factory=list)
     # הדרך המועדפת: כל הסאב-אייטמים של התיק, עם מזהה וסטטוס. השרת מסנן
     # לבד מה מותר לשייך אליו, ומחזיר לכל מסמך את המזהה שאליו להעלות.
     subitems: List[InSubitem] = Field(default_factory=list)
@@ -187,6 +218,29 @@ def _error_text(e: Exception) -> str:
     return f"{name}: {str(e)[:200]}"
 
 
+# מאילו אתרים מותר להוריד. הכתובות מגיעות מבחוץ, ובלי רשימה סגורה כל אחד
+# היה יכול לגרום לשרת להוריד מכל מקום.
+ALLOWED_HOSTS = ("amazonaws.com", "monday.com")
+MAX_FILE_BYTES = 25 * 1024 * 1024
+
+
+def download(url: str) -> bytes:
+    """מוריד קובץ מכתובת חתומה של מונדיי. זמינה שעה מרגע השאילתה."""
+    from urllib.parse import urlparse
+    from urllib.request import urlopen, Request
+
+    p = urlparse(url or "")
+    if p.scheme != "https" or not any(p.hostname and p.hostname.endswith(h)
+                                      for h in ALLOWED_HOSTS):
+        raise ValueError("כתובת מאתר שאינו מורשה")
+    with urlopen(Request(url, headers={"User-Agent": "document-sorter"}),
+                 timeout=30) as r:
+        data = r.read(MAX_FILE_BYTES + 1)
+    if len(data) > MAX_FILE_BYTES:
+        raise ValueError("הקובץ גדול מ-25 מגה")
+    return data
+
+
 def read_all(client, files: list, case_docs: list, only_edges: bool):
     """קורא את כל הקבצים במקביל. מחזיר (תוצאות, שגיאה_קבועה).
 
@@ -198,7 +252,13 @@ def read_all(client, files: list, case_docs: list, only_edges: bool):
     from concurrent.futures import ThreadPoolExecutor
 
     def one(item):
-        name, data = item
+        name, data, url = item
+        if data is None and url:
+            try:
+                data = download(url)
+            except Exception as e:
+                return {"name": name, "data": b"", "error": f"הורדה נכשלה: {e}",
+                        "fatal": False, "a": _failed_fields(name, "הורדה נכשלה")}
         if not data:
             return {"name": name, "data": data, "error": "הקובץ פגום ולא ניתן לפענוח",
                     "fatal": False, "a": _failed_fields(name, "הקובץ פגום")}
@@ -253,17 +313,30 @@ def health():
 
 
 @app.post("/sort", response_model=SortResponse)
-def sort(req: SortRequest):
+def sort(req: SortRequest, x_sorter_token: Optional[str] = Header(default=None)):
     key = os.environ.get("ANTHROPIC_API_KEY")
     if not key:
         raise HTTPException(500, "חסר ANTHROPIC_API_KEY בהגדרות השרת")
-    if not req.files:
+
+    # אסימון גישה. הכתובת של השרת פתוחה לכל העולם, וכל קריאה עולה כסף
+    # בבינה המלאכותית. אם מוגדר SORTER_TOKEN בהגדרות השרת - רק מי שמכיר
+    # אותו יכול לקרוא. אם לא מוגדר - פתוח, כמו היום.
+    token = os.environ.get("SORTER_TOKEN")
+    if token and x_sorter_token != token:
+        raise HTTPException(401, "אסימון גישה שגוי או חסר")
+
+    if req.item:
+        files = [InFile(name=a.name, url=a.public_url) for a in req.item.assets]
+        subitems = req.item.subitems
+    else:
+        files, subitems = req.files, req.subitems
+    if not files:
         raise HTTPException(400, "לא התקבלו קבצים")
 
     client = Anthropic(api_key=key)
     warnings = []
-    if req.subitems:
-        plan = plan_subitems(req.subitems)
+    if subitems:
+        plan = plan_subitems(subitems)
         case_docs = plan["targets"]
         if not plan["extras_id"]:
             warnings.append(f'בתיק אין סאב-אייטם "{EXTRAS_NAME}". מסמכים שלא '
@@ -276,12 +349,16 @@ def sort(req: SortRequest):
 
     # שלב 1 — קריאה. במקביל, בדגם המדויק.
     decoded = []
-    for f in req.files:
-        try:
-            decoded.append((f.name, base64.b64decode(f.content_b64)))
-        except Exception:
-            # קובץ שלא ניתן לפענח לא עוצר את החבילה - הוא הולך לבדיקה ידנית
-            decoded.append((f.name, b""))
+    for f in files:
+        if f.content_b64:
+            try:
+                decoded.append((f.name, base64.b64decode(f.content_b64), None))
+            except Exception:
+                # קובץ שלא ניתן לפענח לא עוצר את החבילה - הוא הולך לבדיקה ידנית
+                decoded.append((f.name, b"", None))
+        else:
+            # התוכן יורד בתוך הקריאה המקבילית, יחד עם הקריאה עצמה
+            decoded.append((f.name, None, f.url))
 
     results, fatal = read_all(client, decoded, case_docs, req.only_edges)
     if fatal:
