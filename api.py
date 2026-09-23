@@ -14,7 +14,7 @@
     POST /sort        החבילה המלאה. זו הנקודה ש-Make משתמש בה
 """
 
-API_BUILD = "api-2026-09-23-v46"
+API_BUILD = "api-2026-09-23-v47"
 
 import base64
 import hashlib
@@ -113,6 +113,8 @@ class SortRequest(BaseModel):
 class OutDoc(BaseModel):
     name: str
     category: str
+    # הסבר לנציג למה המסמך לא הגיע ליעד שלו. ריק כשהכל תקין.
+    reason: str = ""
     target: Optional[str]
     target_conf: float
     confidence: float
@@ -164,7 +166,7 @@ def plan_subitems(subitems: List[InSubitem]) -> dict:
                  שני סאב-אייטמים באותו שם; במקרה כזה לא מנחשים
     extras_id  - המזהה של "מסמכים נוספים", לאן הולך כל מה שלא שויך
     """
-    targets, required, name_to_ids, extras_id = [], [], {}, None
+    targets, required, name_to_ids, extras_id, blocked = [], [], {}, None, []
     for s in subitems:
         name = (s.name or "").strip()
         sid = str(s.id)
@@ -173,6 +175,8 @@ def plan_subitems(subitems: List[InSubitem]) -> dict:
             continue
         status = s.status_text()
         if status not in ALLOWED_STATUSES:
+            # נשמר כדי שנוכל להסביר לנציג "המסמך המתאים כבר סומן תקין"
+            blocked.append((name, status))
             continue
         name_to_ids.setdefault(name, []).append(sid)
         if name not in targets:
@@ -182,7 +186,7 @@ def plan_subitems(subitems: List[InSubitem]) -> dict:
         # תשמש להודעה ללקוח על מה שעוד צריך לשלוח.
         if status == REQUIRED_STATUS and name not in required:
             required.append(name)
-    return {"targets": targets, "required": required,
+    return {"targets": targets, "required": required, "blocked": blocked,
             "name_to_ids": name_to_ids, "extras_id": extras_id}
 
 
@@ -354,6 +358,50 @@ def _failed_fields(name: str, reason: str) -> dict:
             "person_name": None, "source": None}
 
 
+def explain(g: dict, bucket: str, gaps: list, plan: dict, doc_name: str) -> str:
+    """מנסח לנציג למה המסמך לא הגיע לסאב-אייטם שלו.
+
+    בלי זה הנציג רואה קובץ ב"מסמכים נוספים" ולא יודע אם הכלי טעה, אם חסר
+    עמוד, או אם הסאב-אייטם פשוט סגור. הנימוק נכתב כהערה בסאב-אייטם.
+    """
+    if bucket == "matched":
+        return ""
+
+    lines = [doc_name]
+
+    if gaps:
+        lines.append("לא שויך: " + "; ".join(gaps))
+    elif g.get("target"):
+        lines.append("לא שויך: הזיהוי לא היה חד-משמעי")
+    else:
+        # אולי הסאב-אייטם המתאים קיים, אבל סגור לקליטה
+        blocked_names = [n for n, _ in plan.get("blocked", [])]
+        hit = _best_blocked(g, blocked_names, plan)
+        if hit:
+            name, status = hit
+            lines.append(f'לא שויך: המסמך המתאים ("{name}") בסטטוס "{status}" '
+                         'ואינו פתוח לקליטה')
+        else:
+            lines.append("לא שויך: לא נמצא ברשימת המסמכים סעיף מתאים")
+
+    if g.get("target"):
+        lines.append(f'זוהה כשייך ל"{g["target"]}"')
+    return "\n".join(lines)
+
+
+def _best_blocked(g: dict, blocked_names: list, plan: dict):
+    """מחפש התאמה בין המסמך לסאב-אייטם חסום. מחזיר (שם, סטטוס) או None."""
+    if not blocked_names:
+        return None
+    probe = {"members": g["members"], "cat": g["cat"],
+             "target": None, "target_conf": 0.0}
+    engine.assign([probe], blocked_names)
+    if probe.get("target") and probe.get("target_conf", 0) >= 0.7:
+        status = next((s for n, s in plan["blocked"] if n == probe["target"]), "")
+        return probe["target"], status
+    return None
+
+
 def _bucket(conf: float, target, target_conf: float,
             conf_threshold: float, match_threshold: float,
             gaps: list = None) -> str:
@@ -416,7 +464,7 @@ def sort(req: SortRequest, x_sorter_token: Optional[str] = Header(default=None))
     else:
         # תאימות לאחור: רשימת שמות בלבד, בלי מזהים
         case_docs = _clean_docs(req.case_docs)
-        plan = {"targets": case_docs, "required": case_docs,
+        plan = {"targets": case_docs, "required": case_docs, "blocked": [],
                 "name_to_ids": {}, "extras_id": None}
 
     # שלב 1 — קריאה. במקביל, בדגם המדויק.
@@ -475,9 +523,11 @@ def sort(req: SortRequest, x_sorter_token: Optional[str] = Header(default=None))
         pdf = reader.merge_to_pdf([per_file[m["index"]]["bytes"] for m in members],
                                   [m["filename"] for m in members])
         dest_id, dest_name = destination(g["target"], bucket, plan)
+        file_name = reader.safe_filename(name) + ".pdf"
         docs.append(OutDoc(
-            name=reader.safe_filename(name) + ".pdf",
+            name=file_name,
             category=g["cat"],
+            reason=explain(g, bucket, gaps, plan, file_name),
             destination_subitem_id=dest_id,
             destination_name=dest_name,
             target=g["target"] if bucket == "matched" else None,

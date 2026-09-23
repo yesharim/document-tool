@@ -16,7 +16,7 @@
     - מה שאין לו יעד ברור -> בדיקה ידנית עם שם נכון, בלי ניחוש
 """
 
-ENGINE_BUILD = "engine-2026-09-17-v41"
+ENGINE_BUILD = "engine-2026-09-23-v47"
 
 import re
 import unicodedata
@@ -264,6 +264,126 @@ def _source_of(a: dict) -> str:
     return "" if (is_payroll_vendor(s) or is_generic_source(s)) else (s or "")
 
 
+# ------------------------------------------------- שמות שנקראו קצת אחרת
+
+# סף הדמיון בין מילים בשם. כויל על שמות אמיתיים מהתיקים: איות שונה של אותו
+# אדם נותן 0.86 ומעלה ("דיאגנה"/"דיאנה" 0.91, "לוי"/"לוין" 0.86), ושני אנשים
+# שונים באותה משפחה נותנים 0.25 ומטה ("כוכבה"/"אבי"). הפער רחב ובטוח.
+NAME_SIMILARITY = 0.8
+
+
+def _word_match(a: str, b: str) -> bool:
+    import difflib
+    return a == b or difflib.SequenceMatcher(None, a, b).ratio() >= NAME_SIMILARITY
+
+
+def same_person_loose(a: str, b: str) -> bool:
+    """האם שני השמות הם אותו אדם, בסבלנות לשגיאת קריאה.
+
+    כל מילה בשם הקצר חייבת למצוא בת-זוג בשם השני. סדר המילים אינו משנה,
+    כי המודל קורא לעתים "דיאנה כהן" ולעתים "כהן דיאנה". מילה עודפת אחת
+    מותרת - שם אמצעי שנקרא רק באחד הצילומים.
+    """
+    ta, tb = [w for w in norm_person(a).split() if w], [w for w in norm_person(b).split() if w]
+    if not ta or not tb:
+        return False
+    short, long_ = (ta, tb) if len(ta) <= len(tb) else (tb, ta)
+    if len(long_) - len(short) > 1:
+        return False
+    pool = list(long_)
+    for w in short:
+        hit = next((x for x in pool if _word_match(w, x)), None)
+        if hit is None:
+            return False
+        pool.remove(hit)
+    return True
+
+
+def people_similar(pa: frozenset, pb: frozenset) -> bool:
+    """אותה קבוצת אנשים, בסבלנות לאיות. חשבון משותף חייב להתאים בשלמותו."""
+    if not pa or not pb or len(pa) != len(pb):
+        return False
+    pool = list(pb)
+    for name in pa:
+        hit = next((x for x in pool if same_person_loose(name, x)), None)
+        if hit is None:
+            return False
+        pool.remove(hit)
+    return True
+
+
+def _merge_person_variants(buckets: dict) -> dict:
+    """מאחד קבוצות שנפרדו רק בגלל איות שונה של אותו שם, או שם חסר.
+
+    שני מסלולים, שניהם זהירים:
+      איות שונה - "קריסקאוצקי דיאגנה" ו"קריסקאוצקי דיאנה" הם אותו אדם
+      שם חסר    - קובץ שבו השם כלל לא נקרא מצטרף רק אם המנפיק זהה, החודשים
+                  אינם חופפים, ויש בדיוק קבוצה אחת מתאימה
+
+    הפרדה לפי מנפיק נשמרת: אדם שעובד בשני מקומות מקבל שני מסמכים, כי
+    split_by_source רץ אחרי האיחוד הזה ומפצל לפי המעסיק.
+    """
+    items = list(buckets.items())
+    merged, used = [], set()
+
+    # מסלול 1: איות שונה
+    for i, (key_a, mem_a) in enumerate(items):
+        if i in used:
+            continue
+        group = list(mem_a)
+        for j in range(i + 1, len(items)):
+            if j in used:
+                continue
+            key_b, mem_b = items[j]
+            if not _keys_differ_only_by_person(key_a, key_b):
+                continue
+            if people_similar(group[0]["a"]["_people"], mem_b[0]["a"]["_people"]):
+                group.extend(mem_b)
+                used.add(j)
+        merged.append([key_a, group])
+        used.add(i)
+
+    # מסלול 2: שם חסר לגמרי
+    out, leftovers = [], []
+    for key, mem in merged:
+        if mem[0]["a"]["_people"]:
+            out.append([key, mem])
+        else:
+            leftovers.append([key, mem])
+
+    for key, mem in leftovers:
+        fits = [g for g in out
+                if _keys_differ_only_by_person(key, g[0])
+                and _same_issuer(mem, g[1])
+                and not (_months_of(mem) & _months_of(g[1]))]
+        if len(fits) == 1:
+            fits[0][1].extend(mem)
+        else:
+            out.append([key, mem])
+
+    return {tuple(k) if isinstance(k, list) else k: m for k, m in out}
+
+
+def _keys_differ_only_by_person(a: tuple, b: tuple) -> bool:
+    """אותה קטגוריה ואותם שאר מרכיבים; רק רכיב האנשים שונה."""
+    if len(a) != len(b) or a[0] != b[0]:
+        return False
+    return all(x == y for n, (x, y) in enumerate(zip(a, b)) if n != 1)
+
+
+def _same_issuer(mem_a: list, mem_b: list) -> bool:
+    """מנפיק תואם בין שתי קבוצות. בלי זה, שם חסר לעולם אינו מצטרף."""
+    return any(sources_compatible(_source_of(x["a"]), _source_of(y["a"]))
+               for x in mem_a for y in mem_b)
+
+
+def _months_of(members: list) -> set:
+    out = set()
+    for m in members:
+        out |= set(_months(m["a"]) or [])
+    return out
+
+
 def split_by_source(members: list) -> list:
     """מפצל קבוצה לתתי-קבוצות לפי מנפיק, בסבלנות לניסוח שונה.
 
@@ -497,7 +617,7 @@ def build_groups(per_file: list) -> list:
                else group_key(e["a"]))
         buckets.setdefault(key, []).append(e)
 
-    for key, members in buckets.items():
+    for key, members in _merge_person_variants(buckets).items():
         for cluster in split_by_source(members):
             cluster.sort(key=lambda m: (min(_months(m["a"]) or {0}), m["index"]))
             groups.append({"key": key, "cat": cluster[0]["a"]["_cat"],
@@ -609,11 +729,27 @@ def find_gaps(group: dict) -> list:
                   if isinstance(m["a"].get("page_total"), int)), None)
     have = {m["a"].get("page_num") for m in members
             if isinstance(m["a"].get("page_num"), int)}
+    # עמוד מצולם שהמספר בו נחתך נספר גם הוא. בלעדיו הכלי מדווח כחסר עמוד
+    # שנמצא בידיים - ושולח את הנציג לבקש מהלקוח משהו שכבר קיבל.
+    unnumbered = sum(1 for m in members
+                     if not isinstance(m["a"].get("page_num"), int))
     if total and have:
-        missing = [n for n in range(1, total + 1) if n not in have]
-        if missing:
-            gaps.append("חסרים עמודים " +
-                        ", ".join(str(n) for n in missing) + f" מתוך {total}")
+        candidates = [n for n in range(1, total + 1) if n not in have]
+        missing_count = len(candidates) - unnumbered
+        if missing_count > 0:
+            if unnumbered:
+                # ידוע כמה חסרים, לא ידוע אילו מהם
+                gaps.append(f"חסרים {missing_count} עמודים מתוך {total} "
+                            f"(מבין {', '.join(str(n) for n in candidates)} - "
+                            "באחד הצילומים מספר העמוד לא נקרא)"
+                            if missing_count > 1 else
+                            f"חסר עמוד אחד מתוך {total} "
+                            f"(מבין {', '.join(str(n) for n in candidates)} - "
+                            "באחד הצילומים מספר העמוד לא נקרא)")
+            else:
+                gaps.append("חסרים עמודים " +
+                            ", ".join(str(n) for n in candidates) +
+                            f" מתוך {total}")
 
     ordered = sorted(members, key=lambda m: (
         m["a"].get("page_num") if isinstance(m["a"].get("page_num"), int) else 99,
