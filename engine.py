@@ -16,7 +16,7 @@
     - מה שאין לו יעד ברור -> בדיקה ידנית עם שם נכון, בלי ניחוש
 """
 
-ENGINE_BUILD = "engine-2026-09-23-v47"
+ENGINE_BUILD = "engine-2026-09-23-v48"
 
 import re
 import unicodedata
@@ -670,16 +670,34 @@ def _fmt_dates(members: list) -> str:
 
 
 def _people_label(members: list) -> str:
-    """שמות בעלי המסמך, בסדר שבו הופיעו במקור."""
-    seen, out = set(), []
+    """שמות בעלי המסמך, בסדר שבו הופיעו במקור.
+
+    כשאותו אדם נקרא בכמה איותים - "דיאגנה" בצילום אחד ו"דיאנה" בשני - נבחר
+    איות אחד לשם הקובץ, הנפוץ מביניהם. בלי זה שם הקובץ היה מציג את אותה
+    אישה כשני אנשים. חשבון משותף אמיתי נשאר שני שמות, כי הם אינם דומים.
+    """
+    counts, order = {}, []
     for m in members:
         raw = str(m["a"].get("person_name") or "")
         for p in re.split(r"[,;]|\s+ו\s+", raw):
             p = p.strip()
-            if p and norm_person(p) not in seen:
-                seen.add(norm_person(p))
-                out.append(p)
-    return " ו".join(out)
+            if not p:
+                continue
+            counts[p] = counts.get(p, 0) + 1
+            if p not in order:
+                order.append(p)
+
+    clusters = []
+    for p in order:
+        for c in clusters:
+            if same_person_loose(p, c[0]):
+                c.append(p)
+                break
+        else:
+            clusters.append([p])
+
+    # מכל איות נבחר הנפוץ; בתיקו - הארוך, שבדרך כלל שלם יותר
+    return " ו".join(max(c, key=lambda x: (counts[x], len(x))) for c in clusters)
 
 
 def _acct_label(members: list) -> str:
