@@ -14,9 +14,12 @@
     POST /sort        החבילה המלאה. זו הנקודה ש-Make משתמש בה
 """
 
-API_BUILD = "api-2026-09-22-v45"
+API_BUILD = "api-2026-09-23-v46"
 
 import base64
+import hashlib
+import threading
+import time
 import os
 from typing import List, Optional, Union
 
@@ -41,6 +44,8 @@ class InFile(BaseModel):
     name: str
     content_b64: Optional[str] = None
     url: Optional[str] = None
+    # מזהה הקובץ במונדיי. ייחודי וקבוע, ומשמש כמפתח לזיכרון הקריאות.
+    file_id: Optional[Union[str, int]] = None
 
 
 class InAsset(BaseModel):
@@ -241,6 +246,59 @@ def download(url: str) -> bytes:
     return data
 
 
+# ---------------------------------------------------------------- זיכרון קריאות
+#
+# הקריאה של קובץ בבינה המלאכותית היא הדבר היחיד שעולה כסף אמיתי. כל לולאה,
+# מאיזו סיבה שתהיה, נראית אותו דבר: אותם קבצים נשלחים שוב. לכן במקום לנסות
+# לחזות את כל הסיבות ללולאה, הזיכרון מנטרל את המחיר שלה - כל קובץ נקרא פעם
+# אחת, והקריאות הבאות נשלפות.
+#
+# שני עקרונות:
+#   לעולם לא חוסם - הזיכרון מחזיר תוצאה, אף פעם לא סירוב. אין מצב שבו הרצה
+#                    חוזרת נתקעת בגללו.
+#   מפתח יציב     - מזהה הקובץ במונדיי. קובץ שהלקוח שולח שוב מקבל מזהה חדש
+#                    ולכן ייקרא מחדש, כרצוי.
+
+READ_CACHE_TTL = 6 * 3600        # שש שעות
+READ_CACHE_MAX = 5000            # רק השדות שחולצו נשמרים, לא הקובץ עצמו
+_READ_CACHE = {}
+_CACHE_LOCK = threading.Lock()
+_CACHE_STATS = {"hits": 0, "misses": 0}
+
+
+def _cache_key(name: str, file_id, data: bytes) -> str:
+    """מזהה מונדיי כשיש; אחרת טביעת אצבע של התוכן."""
+    if file_id:
+        return f"id:{file_id}"
+    return "sha:" + hashlib.sha256(data).hexdigest()[:32] if data else ""
+
+
+def cache_get(key: str):
+    if not key:
+        return None
+    now = time.time()
+    with _CACHE_LOCK:
+        hit = _READ_CACHE.get(key)
+        if hit and now - hit[0] <= READ_CACHE_TTL:
+            _CACHE_STATS["hits"] += 1
+            return dict(hit[1])
+        if hit:
+            _READ_CACHE.pop(key, None)
+        _CACHE_STATS["misses"] += 1
+    return None
+
+
+def cache_put(key: str, fields: dict) -> None:
+    if not key or not fields:
+        return
+    with _CACHE_LOCK:
+        if len(_READ_CACHE) >= READ_CACHE_MAX:
+            # מפנים את הרבע הישן ביותר, כדי לא לפנות אחד-אחד בכל כתיבה
+            for k in sorted(_READ_CACHE, key=lambda k: _READ_CACHE[k][0])[:READ_CACHE_MAX // 4]:
+                _READ_CACHE.pop(k, None)
+        _READ_CACHE[key] = (time.time(), dict(fields))
+
+
 def read_all(client, files: list, case_docs: list, only_edges: bool):
     """קורא את כל הקבצים במקביל. מחזיר (תוצאות, שגיאה_קבועה).
 
@@ -252,7 +310,19 @@ def read_all(client, files: list, case_docs: list, only_edges: bool):
     from concurrent.futures import ThreadPoolExecutor
 
     def one(item):
-        name, data, url = item
+        name, data, url, file_id = item
+        key = _cache_key(name, file_id, data or b"")
+        cached = cache_get(key)
+        if cached is not None and data is None and url:
+            # התוכן עדיין נדרש למיזוג ה-PDF, אבל ההורדה אינה עולה כסף.
+            try:
+                data = download(url)
+            except Exception as e:
+                return {"name": name, "data": b"", "error": f"הורדה נכשלה: {e}",
+                        "fatal": False, "a": _failed_fields(name, "הורדה נכשלה")}
+        if cached is not None and data:
+            return {"name": name, "data": data, "a": cached,
+                    "error": None, "fatal": False, "cached": True}
         if data is None and url:
             try:
                 data = download(url)
@@ -264,6 +334,7 @@ def read_all(client, files: list, case_docs: list, only_edges: bool):
                     "fatal": False, "a": _failed_fields(name, "הקובץ פגום")}
         try:
             a = reader.read_file(client, name, data, case_docs, only_edges)
+            cache_put(key, a)
             return {"name": name, "data": data, "a": a, "error": None, "fatal": False}
         except Exception as e:
             fatal = type(e).__name__ in _FATAL_ERRORS
@@ -326,7 +397,8 @@ def sort(req: SortRequest, x_sorter_token: Optional[str] = Header(default=None))
         raise HTTPException(401, "אסימון גישה שגוי או חסר")
 
     if req.item:
-        files = [InFile(name=a.name, url=a.public_url) for a in req.item.assets]
+        files = [InFile(name=a.name, url=a.public_url, file_id=a.id)
+                 for a in req.item.assets]
         subitems = req.item.subitems
     else:
         files, subitems = req.files, req.subitems
@@ -352,13 +424,13 @@ def sort(req: SortRequest, x_sorter_token: Optional[str] = Header(default=None))
     for f in files:
         if f.content_b64:
             try:
-                decoded.append((f.name, base64.b64decode(f.content_b64), None))
+                decoded.append((f.name, base64.b64decode(f.content_b64), None, f.file_id))
             except Exception:
                 # קובץ שלא ניתן לפענח לא עוצר את החבילה - הוא הולך לבדיקה ידנית
-                decoded.append((f.name, b"", None))
+                decoded.append((f.name, b"", None, f.file_id))
         else:
             # התוכן יורד בתוך הקריאה המקבילית, יחד עם הקריאה עצמה
-            decoded.append((f.name, None, f.url))
+            decoded.append((f.name, None, f.url, f.file_id))
 
     results, fatal = read_all(client, decoded, case_docs, req.only_edges)
     if fatal:
